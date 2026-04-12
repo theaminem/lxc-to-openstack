@@ -1,0 +1,32 @@
+source:
+  host: "10.0.0.20"
+  bridge: "lxcbr0"
+  bridge_subnet: "10.0.3.0/24"
+
+openstack:
+  auth_url: "http://10.0.0.10:5000/v3"
+  project_name: "migration"
+  user_domain_name: "default"
+  project_domain_name: "default"
+  region: "RegionOne"
+
+network:
+  name: "migration-net"
+  subnet_name: "migration-subnet"
+  cidr: "10.0.3.0/24"
+  gateway: "10.0.3.1"
+  pool_start: "10.0.3.10"
+  pool_end: "10.0.3.60"
+
+compute:
+  image_name: "ubuntu-cloud"
+  flavor_name: "m1.migration"
+  flavor_ram: 1024
+  flavor_vcpus: 1
+  flavor_disk: 10
+  keypair_name: "migration-key"
+
+paths:
+  backup_dir: "backups"
+  key_dir: "keys"
+  log_dir: "logs"
