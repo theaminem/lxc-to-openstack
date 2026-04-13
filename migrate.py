@@ -12,6 +12,13 @@ from src.restorer import Restorer
 from src.validator import Validator
 
 
+def ask_continue():
+    response = input("\nContinue to next phase? (y/n): ")
+    if response.lower() != "y":
+        print("Migration paused. Relaunch to continue.")
+        sys.exit(0)
+
+
 def main():
     print("=" * 50)
     print("  LXC to OpenStack Migration Tool")
@@ -28,6 +35,7 @@ def main():
     logger.info(f"Authenticating as {username}")
 
     rollback = Rollback()
+    conn = None
 
     try:
         # Phase 1 : Scan
@@ -46,6 +54,9 @@ def main():
             logger.error("No containers found. Aborting.")
             sys.exit(1)
 
+        logger.info("PHASE 1 COMPLETE")
+        ask_continue()
+
         # Phase 2 : Network
         logger.info("=" * 40)
         logger.info("PHASE 2: Setting up OpenStack network")
@@ -55,6 +66,8 @@ def main():
         network, subnet, ports = net_manager.setup_migration_network(
             inventory
         )
+        logger.info("PHASE 2 COMPLETE")
+        ask_continue()
 
         # Phase 3-4 : Provisioning
         logger.info("=" * 40)
@@ -65,6 +78,8 @@ def main():
         instances, private_key_path = provisioner.provision_all(
             inventory, ports
         )
+        logger.info("PHASE 3-4 COMPLETE")
+        ask_continue()
 
         # Phase 5 : Backup
         logger.info("=" * 40)
@@ -72,6 +87,8 @@ def main():
         logger.info("=" * 40)
         backup_mgr = BackupManager(config)
         backup_paths = backup_mgr.backup_all(inventory)
+        logger.info("PHASE 5 COMPLETE")
+        ask_continue()
 
         # Phase 6 : Transfer
         logger.info("=" * 40)
@@ -81,6 +98,8 @@ def main():
         transfer.transfer_all(
             inventory, backup_paths, private_key_path
         )
+        logger.info("PHASE 6 COMPLETE")
+        ask_continue()
 
         # Phase 7 : Restoration
         logger.info("=" * 40)
@@ -90,6 +109,8 @@ def main():
         restorer.restore_all(
             inventory, backup_paths, private_key_path
         )
+        logger.info("PHASE 7 COMPLETE")
+        ask_continue()
 
         # Phase 8 : Validation
         logger.info("=" * 40)
