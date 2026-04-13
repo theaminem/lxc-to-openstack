@@ -85,8 +85,21 @@ def detect_service(name, ports):
     )
     if "mysqldump" in crontab:
         return "backup"
+    if "backup" in crontab or ".sh" in crontab:
+        script_content = ""
+        for line in crontab.split("\n"):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                parts = line.split()
+                for part in parts:
+                    if "/" in part and ".sh" in part:
+                        script_content = run_command(
+                            f"sudo lxc-attach -n {name} -- cat {part} 2>/dev/null"
+                        )
+                        break
+        if "mysqldump" in script_content or "backup" in script_content:
+            return "backup"
     return "unknown"
-
 
 def get_mariadb_details(name):
     databases = run_command(

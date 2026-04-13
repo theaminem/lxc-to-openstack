@@ -102,6 +102,50 @@ class Provisioner:
         logger.info(f"Private key saved: {private_key_path}")
         return keypair, private_key_path
 
+    def ensure_volume(self, name, size):
+        existing = self.conn.block_storage.find_volume(name)
+        if existing:
+            if existing.status == "available" or existing.status == "in-use":
+                logger.info(f"Volume {name} already exists, reusing")
+                return existing
+            else:
+                logger.warning(
+                    f"Volume {name} exists but status is "
+                    f"{existing.status}. Deleting and recreating."
+                )
+                self.conn.block_storage.delete_volume(existing.id)
+                self.conn.block_storage.wait_for_delete(existing)
+
+        logger.info(f"Creating volume {name} ({size}GB)...")
+        volume = self.conn.block_storage.create_volume(
+            name=name,
+            size=size
+        )
+        self.conn.block_storage.wait_for_status(
+            volume, status="available", wait=120
+        )
+        self.rollback.register("volume", volume.id, name)
+        logger.info(f"Volume {name} created ({size}GB)")
+        return volume
+
+    def attach_volume(self, server_id, volume_id, server_name):
+        attachments = list(
+            self.conn.compute.volume_attachments(server_id)
+        )
+        for att in attachments:
+            if att.volume_id == volume_id:
+                logger.info(
+                    f"Volume already attached to {server_name}"
+                )
+                return att
+
+        attachment = self.conn.compute.create_volume_attachment(
+            server_id,
+            volume_id=volume_id
+        )
+        logger.info(f"Volume attached to {server_name}")
+        return attachment
+
     def create_instance(self, name, image, flavor, port, keypair_name):
         existing = self.conn.compute.find_server(name)
         if existing:
@@ -169,6 +213,14 @@ class Provisioner:
         keypair, private_key_path = self.ensure_keypair()
         keypair_name = self.config["compute"]["keypair_name"]
 
+        storage_config = self.config.get("storage", {})
+        volume = None
+        if storage_config:
+            volume = self.ensure_volume(
+                storage_config["mariadb_volume_name"],
+                storage_config["mariadb_volume_size"]
+            )
+
         instances = {}
         for container in inventory:
             name = container["name"]
@@ -179,6 +231,16 @@ class Provisioner:
                 instance_name, image, flavor, port, keypair_name
             )
             instances[name] = server
+
+        if volume:
+            for container in inventory:
+                if container["service"] == "mariadb":
+                    name = container["name"]
+                    server = instances[name]
+                    self.attach_volume(
+                        server.id, volume.id, f"instance-{name}"
+                    )
+                    break
 
         for container in inventory:
             name = container["name"]
