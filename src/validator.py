@@ -18,10 +18,10 @@ class Validator:
         )
         jump_client.connect(
             hostname=self.jump_host,
-            username="user",
-            key_filename=private_key_path
+            username=self.config["jump"]["username"],
+            password=self.config["jump"]["password"],
+            timeout=10
         )
-
         jump_transport = jump_client.get_transport()
         jump_channel = jump_transport.open_channel(
             "direct-tcpip",

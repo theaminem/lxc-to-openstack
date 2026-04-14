@@ -69,8 +69,12 @@ class NetworkManager:
         net_config = self.config["network"]
         router_name = net_config["router_name"]
         ext_network_name = net_config["external_network"]
-
-        existing = self.conn.network.find_router(router_name)
+        
+        try:
+            existing = self.conn.network.find_router(router_name)
+        except Exception:
+            existing = None
+  
         if existing:
             logger.info(
                 f"Router {router_name} already exists, reusing"
@@ -106,12 +110,11 @@ class NetworkManager:
             self.conn.network.ports(network_id=network_id)
         )
         for port in existing_ports:
-            for fixed_ip in port.fixed_ips:
-                if fixed_ip["ip_address"] == ip:
-                    logger.info(
-                        f"Port with IP {ip} already exists, reusing"
-                    )
-                    return port
+            if port.name == port_name:
+                logger.info(
+                    f"Port {port_name} already exists, reusing"
+                )
+                return port
 
         sg_ids = [sg.id for sg in security_groups]
         port = self.conn.network.create_port(
@@ -249,12 +252,23 @@ class NetworkManager:
         subnet = self.find_or_create_subnet(network.id)
         router = self.find_or_create_router(subnet.id)
 
+        known_services = [
+            "mariadb", "apache", "backup", "nfs", "ftp"
+        ]
+
         ports = {}
         for container in inventory:
             name = container["name"]
-            ip = container["ip"]
             service = container["service"]
+            ip = container["ip"]
             port_name = f"port-{name}"
+
+            if service not in known_services:
+                logger.warning(
+                    f"Unknown service {service} on {name}, "
+                    f"skipping port creation"
+                )
+                continue
 
             sgs = self.get_security_groups_for_service(
                 service, security_groups

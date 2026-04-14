@@ -30,9 +30,13 @@ def main():
     logger = setup_logger(config)
     logger.info("Configuration loaded")
 
+    
     username = input("OpenStack username: ")
     password = getpass.getpass("OpenStack password: ")
+    jump_user = input("VM-cible SSH username: ")
+    jump_password = getpass.getpass("VM-cible SSH password: ")
     logger.info(f"Authenticating as {username}")
+    config["jump"] = {"username": jump_user, "password": jump_password}
 
     rollback = Rollback()
     conn = None

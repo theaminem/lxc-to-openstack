@@ -15,8 +15,8 @@ network:
   subnet_name: "migration-subnet"
   cidr: "10.0.3.0/24"
   gateway: "10.0.3.1"
-  pool_start: "10.0.3.10"
-  pool_end: "10.0.3.60"
+  pool_start: "10.0.3.100"
+  pool_end: "10.0.3.200"
   external_network: "provider"
   router_name: "migration-router"
 

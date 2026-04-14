@@ -180,25 +180,48 @@ class Provisioner:
         return server
 
     def wait_for_ssh(self, ip, private_key_path, timeout=120):
-        logger.info(f"Waiting for SSH on {ip}...")
+        logger.info(f"Waiting for SSH on {ip} (via jump host)...")
+        jump_host = self.config["openstack"]["auth_url"].split("//")[1].split(":")[0]
+        jump_user = self.config["jump"]["username"]
+        jump_password = self.config["jump"]["password"]
         start = time.time()
 
         while time.time() - start < timeout:
             try:
-                client = paramiko.SSHClient()
-                client.set_missing_host_key_policy(
+                jump_client = paramiko.SSHClient()
+                jump_client.set_missing_host_key_policy(
+                    paramiko.AutoAddPolicy()
+                )
+                jump_client.connect(
+                    hostname=jump_host,
+                    username=jump_user,
+                    password=jump_password,
+                    timeout=5
+                )
+
+                jump_transport = jump_client.get_transport()
+                jump_channel = jump_transport.open_channel(
+                    "direct-tcpip",
+                    (ip, 22),
+                    (jump_host, 0)
+                )
+
+                target_client = paramiko.SSHClient()
+                target_client.set_missing_host_key_policy(
                     paramiko.AutoAddPolicy()
                 )
                 key = paramiko.RSAKey.from_private_key_file(
                     private_key_path
                 )
-                client.connect(
+                target_client.connect(
                     hostname=ip,
                     username="ubuntu",
                     pkey=key,
+                    sock=jump_channel,
                     timeout=5
                 )
-                client.close()
+                target_client.close()
+                jump_client.close()
                 logger.info(f"SSH ready on {ip}")
                 return True
             except Exception:
