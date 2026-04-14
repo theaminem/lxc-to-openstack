@@ -9,39 +9,20 @@ class Validator:
 
     def __init__(self, config):
         self.config = config
-        self.jump_host = config["openstack"]["auth_url"].split("//")[1].split(":")[0]
 
     def _get_ssh_client(self, ip, private_key_path):
-        jump_client = paramiko.SSHClient()
-        jump_client.set_missing_host_key_policy(
-            paramiko.AutoAddPolicy()
-        )
-        jump_client.connect(
-            hostname=self.jump_host,
-            username=self.config["jump"]["username"],
-            password=self.config["jump"]["password"],
-            timeout=10
-        )
-        jump_transport = jump_client.get_transport()
-        jump_channel = jump_transport.open_channel(
-            "direct-tcpip",
-            (ip, 22),
-            (self.jump_host, 0)
-        )
-
-        target_client = paramiko.SSHClient()
-        target_client.set_missing_host_key_policy(
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(
             paramiko.AutoAddPolicy()
         )
         key = paramiko.RSAKey.from_private_key_file(private_key_path)
-        target_client.connect(
+        client.connect(
             hostname=ip,
             username="ubuntu",
             pkey=key,
-            sock=jump_channel
+            timeout=10
         )
-
-        return target_client, jump_client
+        return client, None
 
     def _run_remote(self, client, command):
         stdin, stdout, stderr = client.exec_command(command)
@@ -60,7 +41,8 @@ class Validator:
         )
 
         client.close()
-        jump.close()
+        if jump:
+            jump.close()
 
         if exit_code != 0:
             logger.error("MariaDB validation FAILED: cannot connect")
@@ -96,7 +78,8 @@ class Validator:
         )
 
         client.close()
-        jump.close()
+        if jump:
+            jump.close()
 
         if exit_code == 0 and output == "200":
             logger.info("Apache validation PASSED (HTTP 200)")
@@ -128,7 +111,8 @@ class Validator:
         )
 
         client.close()
-        jump.close()
+        if jump:
+            jump.close()
 
         cron_ok = exit_code_cron == 0 and len(crontab) > 0
         dump_ok = exit_code_dump == 0
@@ -163,7 +147,8 @@ class Validator:
         )
 
         client.close()
-        jump.close()
+        if jump:
+            jump.close()
 
         service_ok = exit_code_service == 0 and output == "active"
         exports_ok = exit_code_exports == 0 and len(exports) > 0
@@ -193,7 +178,8 @@ class Validator:
         )
 
         client.close()
-        jump.close()
+        if jump:
+            jump.close()
 
         service_ok = exit_code_service == 0 and output == "active"
         port_ok = exit_code_port == 0 and len(port_check) > 0
@@ -210,25 +196,30 @@ class Validator:
             logger.error("FTP validation: port 21 not listening")
         return False
 
-    def validate_all(self, inventory, backup_paths, private_key_path):
+    def validate_all(self, inventory, backup_paths,
+                     private_key_path, ports):
         results = {}
         mariadb_ip = None
 
         for container in inventory:
             if container["service"] == "mariadb":
-                mariadb_ip = container["ip"]
+                if container["name"] in ports:
+                    mariadb_ip = ports[container["name"]].fixed_ips[0]["ip_address"]
                 break
 
         for container in inventory:
             name = container["name"]
-            ip = container["ip"]
             service = container["service"]
+
+            if name not in ports:
+                continue
+
+            port = ports[name]
+            ip = port.fixed_ips[0]["ip_address"]
 
             try:
                 if service == "mariadb":
-                    source_count = self._get_source_count(
-                        name
-                    )
+                    source_count = self._get_source_count(name)
                     results[name] = self.validate_mariadb(
                         ip, private_key_path, source_count
                     )

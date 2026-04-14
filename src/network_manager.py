@@ -12,6 +12,7 @@ class NetworkManager:
         self.config = config
         self.rollback = rollback
         self.conn = None
+        self.use_provider = config["network"].get("use_provider", False)
 
     def connect(self, username, password):
         os_config = self.config["openstack"]
@@ -69,12 +70,12 @@ class NetworkManager:
         net_config = self.config["network"]
         router_name = net_config["router_name"]
         ext_network_name = net_config["external_network"]
-        
+
         try:
             existing = self.conn.network.find_router(router_name)
         except Exception:
             existing = None
-  
+
         if existing:
             logger.info(
                 f"Router {router_name} already exists, reusing"
@@ -117,17 +118,21 @@ class NetworkManager:
                 return port
 
         sg_ids = [sg.id for sg in security_groups]
-        port = self.conn.network.create_port(
-            name=port_name,
-            network_id=network_id,
-            fixed_ips=[{
+        port_params = {
+            "name": port_name,
+            "network_id": network_id,
+            "security_group_ids": sg_ids
+        }
+        if ip:
+            port_params["fixed_ips"] = [{
                 "subnet_id": subnet_id,
                 "ip_address": ip
-            }],
-            security_group_ids=sg_ids
-        )
+            }]
+
+        port = self.conn.network.create_port(**port_params)
         self.rollback.register("port", port.id, port_name)
-        logger.info(f"Created port: {port_name} ({ip})")
+        ip_assigned = port.fixed_ips[0]["ip_address"]
+        logger.info(f"Created port: {port_name} ({ip_assigned})")
         return port
 
     def find_or_create_security_group(self, name, description):
@@ -248,25 +253,45 @@ class NetworkManager:
     def setup_migration_network(self, inventory):
         security_groups = self.setup_security_groups()
 
-        network = self.find_or_create_network()
-        subnet = self.find_or_create_subnet(network.id)
-        router = self.find_or_create_router(subnet.id)
-
         known_services = [
             "mariadb", "apache", "backup", "nfs", "ftp"
         ]
+
+        net_config = self.config["network"]
+
+        if self.use_provider:
+            network = self.conn.network.find_network(
+                net_config["name"]
+            )
+            if not network:
+                raise Exception(
+                    f"Provider network {net_config['name']} not found"
+                )
+            subnets = list(
+                self.conn.network.subnets(network_id=network.id)
+            )
+            if not subnets:
+                raise Exception("No subnet on provider network")
+            subnet = subnets[0]
+            logger.info(
+                f"Using provider network: {net_config['name']}"
+            )
+        else:
+            network = self.find_or_create_network()
+            subnet = self.find_or_create_subnet(network.id)
+            router = self.find_or_create_router(subnet.id)
+            logger.info("Tenant network created with router")
 
         ports = {}
         for container in inventory:
             name = container["name"]
             service = container["service"]
-            ip = container["ip"]
             port_name = f"port-{name}"
 
             if service not in known_services:
                 logger.warning(
                     f"Unknown service {service} on {name}, "
-                    f"skipping port creation"
+                    f"skipping"
                 )
                 continue
 
@@ -274,9 +299,15 @@ class NetworkManager:
                 service, security_groups
             )
 
-            port = self.find_or_create_port(
-                network.id, subnet.id, ip, port_name, sgs
-            )
+            if self.use_provider:
+                port = self.find_or_create_port(
+                    network.id, subnet.id, None, port_name, sgs
+                )
+            else:
+                ip = container["ip"]
+                port = self.find_or_create_port(
+                    network.id, subnet.id, ip, port_name, sgs
+                )
             ports[name] = port
 
         logger.info(

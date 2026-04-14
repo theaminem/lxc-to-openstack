@@ -180,48 +180,25 @@ class Provisioner:
         return server
 
     def wait_for_ssh(self, ip, private_key_path, timeout=120):
-        logger.info(f"Waiting for SSH on {ip} (via jump host)...")
-        jump_host = self.config["openstack"]["auth_url"].split("//")[1].split(":")[0]
-        jump_user = self.config["jump"]["username"]
-        jump_password = self.config["jump"]["password"]
+        logger.info(f"Waiting for SSH on {ip}...")
         start = time.time()
 
         while time.time() - start < timeout:
             try:
-                jump_client = paramiko.SSHClient()
-                jump_client.set_missing_host_key_policy(
-                    paramiko.AutoAddPolicy()
-                )
-                jump_client.connect(
-                    hostname=jump_host,
-                    username=jump_user,
-                    password=jump_password,
-                    timeout=5
-                )
-
-                jump_transport = jump_client.get_transport()
-                jump_channel = jump_transport.open_channel(
-                    "direct-tcpip",
-                    (ip, 22),
-                    (jump_host, 0)
-                )
-
-                target_client = paramiko.SSHClient()
-                target_client.set_missing_host_key_policy(
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(
                     paramiko.AutoAddPolicy()
                 )
                 key = paramiko.RSAKey.from_private_key_file(
                     private_key_path
                 )
-                target_client.connect(
+                client.connect(
                     hostname=ip,
                     username="ubuntu",
                     pkey=key,
-                    sock=jump_channel,
                     timeout=5
                 )
-                target_client.close()
-                jump_client.close()
+                client.close()
                 logger.info(f"SSH ready on {ip}")
                 return True
             except Exception:
@@ -229,7 +206,7 @@ class Provisioner:
 
         logger.error(f"SSH timeout on {ip} after {timeout}s")
         return False
-
+     
     def provision_all(self, inventory, ports):
         image = self.ensure_image()
         flavor = self.ensure_flavor()
@@ -267,13 +244,16 @@ class Provisioner:
 
         for container in inventory:
             name = container["name"]
-            ip = container["ip"]
-            ssh_ready = self.wait_for_ssh(ip, private_key_path)
+            if name not in ports:
+                continue
+            port = ports[name]
+            target_ip = port.fixed_ips[0]["ip_address"]
+            ssh_ready = self.wait_for_ssh(target_ip, private_key_path)
             if not ssh_ready:
                 raise Exception(
-                    f"Cannot reach {name} via SSH at {ip}"
+                    f"Cannot reach {name} via SSH at {target_ip}"
                 )
-
+  
         logger.info(
             f"Provisioning complete: {len(instances)} instances"
         )

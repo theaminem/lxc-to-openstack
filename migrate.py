@@ -30,13 +30,9 @@ def main():
     logger = setup_logger(config)
     logger.info("Configuration loaded")
 
-    
     username = input("OpenStack username: ")
     password = getpass.getpass("OpenStack password: ")
-    jump_user = input("VM-cible SSH username: ")
-    jump_password = getpass.getpass("VM-cible SSH password: ")
     logger.info(f"Authenticating as {username}")
-    config["jump"] = {"username": jump_user, "password": jump_password}
 
     rollback = Rollback()
     conn = None
@@ -100,7 +96,7 @@ def main():
         logger.info("=" * 40)
         transfer = Transfer(config)
         transfer.transfer_all(
-            inventory, backup_paths, private_key_path
+            inventory, backup_paths, private_key_path, ports
         )
         logger.info("PHASE 6 COMPLETE")
         ask_continue()
@@ -111,7 +107,7 @@ def main():
         logger.info("=" * 40)
         restorer = Restorer(config)
         restorer.restore_all(
-            inventory, backup_paths, private_key_path
+            inventory, backup_paths, private_key_path, ports
         )
         logger.info("PHASE 7 COMPLETE")
         ask_continue()
@@ -122,7 +118,7 @@ def main():
         logger.info("=" * 40)
         validator = Validator(config)
         results = validator.validate_all(
-            inventory, backup_paths, private_key_path
+            inventory, backup_paths, private_key_path, ports
         )
 
         # Resume final

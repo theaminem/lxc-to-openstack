@@ -11,14 +11,15 @@ openstack:
   region: "RegionOne"
 
 network:
-  name: "migration-net"
-  subnet_name: "migration-subnet"
-  cidr: "10.0.3.0/24"
-  gateway: "10.0.3.1"
-  pool_start: "10.0.3.100"
-  pool_end: "10.0.3.200"
+  name: "provider"
+  subnet_name: "provider-subnet"
+  cidr: "10.0.0.0/24"
+  gateway: "10.0.0.1"
+  pool_start: "10.0.0.100"
+  pool_end: "10.0.0.200"
   external_network: "provider"
   router_name: "migration-router"
+  use_provider: true
 
 compute:
   image_name: "ubuntu-cloud"

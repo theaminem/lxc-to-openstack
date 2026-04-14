@@ -10,40 +10,20 @@ class Restorer:
 
     def __init__(self, config):
         self.config = config
-        self.jump_host = config["openstack"]["auth_url"].split("//")[1].split(":")[0]
 
     def _get_ssh_client(self, ip, private_key_path):
-        jump_client = paramiko.SSHClient()
-        jump_client.set_missing_host_key_policy(
-            paramiko.AutoAddPolicy()
-        )
-        jump_client.connect(
-            hostname=self.jump_host,
-            username=self.config["jump"]["username"],
-            password=self.config["jump"]["password"],
-            timeout=10
-        )
-
-        jump_transport = jump_client.get_transport()
-        jump_channel = jump_transport.open_channel(
-            "direct-tcpip",
-            (ip, 22),
-            (self.jump_host, 0)
-        )
-
-        target_client = paramiko.SSHClient()
-        target_client.set_missing_host_key_policy(
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(
             paramiko.AutoAddPolicy()
         )
         key = paramiko.RSAKey.from_private_key_file(private_key_path)
-        target_client.connect(
+        client.connect(
             hostname=ip,
             username="ubuntu",
             pkey=key,
-            sock=jump_channel
+            timeout=10
         )
-
-        return target_client, jump_client
+        return client, None
 
     def _run_remote(self, client, command, description=""):
         if description:
@@ -160,8 +140,9 @@ class Restorer:
         )
 
         client.close()
-        jump.close()
-        logger.info("MariaDB restoration complete (Cinder volume)") 
+        if jump:
+            jump.close()
+        logger.info("MariaDB restoration complete (Cinder volume)")
 
     def restore_apache(self, ip, private_key_path):
         logger.info(f"Restoring Apache on {ip}...")
@@ -210,7 +191,8 @@ class Restorer:
         )
 
         client.close()
-        jump.close()
+        if jump:
+            jump.close()
         logger.info("Apache restoration complete")
 
     def restore_backup(self, ip, private_key_path):
@@ -243,7 +225,8 @@ class Restorer:
             logger.warning("No crontab found, skipping")
 
         client.close()
-        jump.close()
+        if jump:
+            jump.close()
         logger.info("Backup service restoration complete")
 
     def restore_nfs(self, ip, private_key_path, shared_dirs):
@@ -291,7 +274,8 @@ class Restorer:
         )
 
         client.close()
-        jump.close()
+        if jump:
+            jump.close()
         logger.info("NFS restoration complete")
 
     def restore_ftp(self, ip, private_key_path, server_type):
@@ -354,14 +338,48 @@ class Restorer:
         )
 
         client.close()
-        jump.close()
+        if jump:
+            jump.close()
         logger.info("FTP restoration complete")
 
-    def restore_all(self, inventory, backup_paths, private_key_path):
+    def update_ip_mappings(self, ip, private_key_path, ip_map):
+        logger.info(f"Updating IP mappings on {ip}...")
+        client, jump = self._get_ssh_client(ip, private_key_path)
+
+        for old_ip, new_ip in ip_map.items():
+            self._run_remote(
+                client,
+                f"sudo grep -rl '{old_ip}' /etc/ /var/www/ "
+                f"/root/ 2>/dev/null | while read f; do "
+                f"sudo sed -i 's/{old_ip}/{new_ip}/g' \"$f\"; done",
+                f"Replacing {old_ip} -> {new_ip}"
+            )
+
+        client.close()
+        if jump:
+            jump.close()
+        logger.info("IP mappings updated")
+
+    def restore_all(self, inventory, backup_paths,
+                    private_key_path, ports):
+        ip_map = {}
         for container in inventory:
             name = container["name"]
-            ip = container["ip"]
+            if name in ports:
+                old_ip = container["ip"]
+                new_ip = ports[name].fixed_ips[0]["ip_address"]
+                if old_ip != new_ip:
+                    ip_map[old_ip] = new_ip
+
+        for container in inventory:
+            name = container["name"]
             service = container["service"]
+
+            if name not in ports:
+                continue
+
+            port = ports[name]
+            ip = port.fixed_ips[0]["ip_address"]
 
             if service == "mariadb":
                 self.restore_mariadb(ip, private_key_path)
@@ -369,19 +387,3 @@ class Restorer:
                 self.restore_apache(ip, private_key_path)
             elif service == "backup":
                 self.restore_backup(ip, private_key_path)
-            elif service == "nfs":
-                shared_dirs = []
-                if name in backup_paths:
-                    shared_dirs = backup_paths[name].get(
-                        "shared_dirs", []
-                    )
-                self.restore_nfs(ip, private_key_path, shared_dirs)
-            elif service == "ftp":
-                server_type = "vsftpd"
-                if name in backup_paths:
-                    server_type = backup_paths[name].get(
-                        "server_type", "vsftpd"
-                    )
-                self.restore_ftp(ip, private_key_path, server_type)
-
-        logger.info("All restorations complete")

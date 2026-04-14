@@ -10,39 +10,20 @@ class Transfer:
 
     def __init__(self, config):
         self.config = config
-        self.jump_host = config["openstack"]["auth_url"].split("//")[1].split(":")[0]
 
     def _get_ssh_client(self, ip, private_key_path):
-        jump_client = paramiko.SSHClient()
-        jump_client.set_missing_host_key_policy(
-            paramiko.AutoAddPolicy()
-        )
-        jump_client.connect(
-            hostname=self.jump_host,
-            username=self.config["jump"]["username"],
-            password=self.config["jump"]["password"],
-            timeout=10
-        )
-        jump_transport = jump_client.get_transport()
-        jump_channel = jump_transport.open_channel(
-            "direct-tcpip",
-            (ip, 22),
-            (self.jump_host, 0)
-        )
-
-        target_client = paramiko.SSHClient()
-        target_client.set_missing_host_key_policy(
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(
             paramiko.AutoAddPolicy()
         )
         key = paramiko.RSAKey.from_private_key_file(private_key_path)
-        target_client.connect(
+        client.connect(
             hostname=ip,
             username="ubuntu",
             pkey=key,
-            sock=jump_channel
+            timeout=10
         )
-
-        return target_client, jump_client
+        return client, None
 
     def upload_file(self, ssh_client, local_path, remote_path):
         if not os.path.exists(local_path):
@@ -76,7 +57,8 @@ class Transfer:
         )
 
         client.close()
-        jump.close()
+        if jump:
+            jump.close()
         logger.info("MariaDB transfer complete")
 
     def transfer_apache(self, ip, private_key_path, backup_paths):
@@ -95,7 +77,8 @@ class Transfer:
         )
 
         client.close()
-        jump.close()
+        if jump:
+            jump.close()
         logger.info("Apache transfer complete")
 
     def transfer_backup(self, ip, private_key_path, backup_paths):
@@ -115,7 +98,8 @@ class Transfer:
             )
 
         client.close()
-        jump.close()
+        if jump:
+            jump.close()
         logger.info("Backup transfer complete")
 
     def transfer_nfs(self, ip, private_key_path, backup_paths):
@@ -135,7 +119,8 @@ class Transfer:
             )
 
         client.close()
-        jump.close()
+        if jump:
+            jump.close()
         logger.info("NFS transfer complete")
 
     def transfer_ftp(self, ip, private_key_path, backup_paths):
@@ -160,7 +145,8 @@ class Transfer:
             )
 
         client.close()
-        jump.close()
+        if jump:
+            jump.close()
         logger.info("FTP transfer complete")
 
     def _file_size(self, size):
@@ -171,16 +157,20 @@ class Transfer:
         else:
             return f"{size // (1024 * 1024)}MB"
 
-    def transfer_all(self, inventory, backup_paths, private_key_path):
+    def transfer_all(self, inventory, backup_paths,
+                     private_key_path, ports):
         for container in inventory:
             name = container["name"]
-            ip = container["ip"]
             service = container["service"]
 
             if name not in backup_paths:
                 logger.warning(f"No backup for {name}, skipping")
                 continue
+            if name not in ports:
+                continue
 
+            port = ports[name]
+            ip = port.fixed_ips[0]["ip_address"]
             paths = backup_paths[name]
 
             if service == "mariadb":
