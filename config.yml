@@ -14,7 +14,7 @@ network:
   name: "provider"
   subnet_name: "provider-subnet"
   cidr: "10.0.0.0/24"
-  gateway: "10.0.0.1"
+  gateway: "10.0.0.20"
   pool_start: "10.0.0.100"
   pool_end: "10.0.0.200"
   external_network: "provider"

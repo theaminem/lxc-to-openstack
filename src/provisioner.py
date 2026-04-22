@@ -26,20 +26,58 @@ class Provisioner:
             logger.info(f"Image {name} already exists, reusing")
             return existing
 
-        image_path = self.config.get("image_path", None)
-        if not image_path:
-            logger.error("No image_path in config.yml")
-            raise Exception("image_path missing in config.yml")
-
-        logger.info(f"Uploading image {name} from {image_path}...")
-        image = self.conn.image.create_image(
-            name=name,
-            filename=image_path,
-            disk_format="qcow2",
-            container_format="bare",
-            visibility="public"
+        logger.info(
+            f"Image {name} not found, uploading on vm-cible..."
         )
-        logger.info(f"Image {name} uploaded")
+
+        jump_host = self.config["openstack"]["auth_url"].split("//")[1].split(":")[0]
+        jump_user = self.config["jump"]["username"]
+        jump_password = self.config["jump"]["password"]
+
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(
+            paramiko.AutoAddPolicy()
+        )
+        client.connect(
+            hostname=jump_host,
+            username=jump_user,
+            password=jump_password,
+            timeout=10
+        )
+
+        image_url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+        remote_path = "/tmp/ubuntu-cloud.img"
+
+        logger.info("Downloading image on vm-cible...")
+        stdin, stdout, stderr = client.exec_command(
+            f"wget -q {image_url} -O {remote_path}"
+        )
+        exit_code = stdout.channel.recv_exit_status()
+        if exit_code != 0:
+            errors = stderr.read().decode()
+            client.close()
+            raise Exception(f"Image download failed: {errors}")
+        logger.info("Image downloaded on vm-cible")
+
+        logger.info("Uploading image to Glance...")
+        stdin, stdout, stderr = client.exec_command(
+            f"source ~/admin-openrc && "
+            f"openstack image create \"{name}\" "
+            f"--file {remote_path} "
+            f"--disk-format qcow2 "
+            f"--container-format bare --public"
+        )
+        exit_code = stdout.channel.recv_exit_status()
+        errors = stderr.read().decode()
+        if exit_code != 0:
+            client.close()
+            raise Exception(f"Image upload failed: {errors}")
+        logger.info(f"Image {name} uploaded to Glance")
+
+        client.exec_command(f"rm -f {remote_path}")
+        client.close()
+
+        image = self.conn.image.find_image(name)
         return image
 
     def ensure_flavor(self):
@@ -57,7 +95,6 @@ class Provisioner:
             vcpus=comp["flavor_vcpus"],
             disk=comp["flavor_disk"]
         )
-        self.rollback.register("flavor", flavor.id, name)
         logger.info(
             f"Created flavor: {name} "
             f"(RAM={comp['flavor_ram']}MB, "
@@ -97,7 +134,6 @@ class Provisioner:
             name=name,
             public_key=public_key
         )
-        self.rollback.register("keypair", name, name)
         logger.info(f"Created keypair: {name}")
         logger.info(f"Private key saved: {private_key_path}")
         return keypair, private_key_path
@@ -180,25 +216,48 @@ class Provisioner:
         return server
 
     def wait_for_ssh(self, ip, private_key_path, timeout=120):
-        logger.info(f"Waiting for SSH on {ip}...")
+        logger.info(f"Waiting for SSH on {ip} (via jump host)...")
+        jump_host = self.config["openstack"]["auth_url"].split("//")[1].split(":")[0]
+        jump_user = self.config["jump"]["username"]
+        jump_password = self.config["jump"]["password"]
         start = time.time()
 
         while time.time() - start < timeout:
             try:
-                client = paramiko.SSHClient()
-                client.set_missing_host_key_policy(
+                jump_client = paramiko.SSHClient()
+                jump_client.set_missing_host_key_policy(
+                    paramiko.AutoAddPolicy()
+                )
+                jump_client.connect(
+                    hostname=jump_host,
+                    username=jump_user,
+                    password=jump_password,
+                    timeout=5
+                )
+
+                jump_transport = jump_client.get_transport()
+                jump_channel = jump_transport.open_channel(
+                    "direct-tcpip",
+                    (ip, 22),
+                    (jump_host, 0)
+                )
+
+                target_client = paramiko.SSHClient()
+                target_client.set_missing_host_key_policy(
                     paramiko.AutoAddPolicy()
                 )
                 key = paramiko.RSAKey.from_private_key_file(
                     private_key_path
                 )
-                client.connect(
+                target_client.connect(
                     hostname=ip,
                     username="ubuntu",
                     pkey=key,
+                    sock=jump_channel,
                     timeout=5
                 )
-                client.close()
+                target_client.close()
+                jump_client.close()
                 logger.info(f"SSH ready on {ip}")
                 return True
             except Exception:
@@ -206,7 +265,7 @@ class Provisioner:
 
         logger.error(f"SSH timeout on {ip} after {timeout}s")
         return False
-     
+
     def provision_all(self, inventory, ports):
         image = self.ensure_image()
         flavor = self.ensure_flavor()
@@ -224,6 +283,8 @@ class Provisioner:
         instances = {}
         for container in inventory:
             name = container["name"]
+            if name not in ports:
+                continue
             instance_name = f"instance-{name}"
             port = ports[name]
 
@@ -236,10 +297,12 @@ class Provisioner:
             for container in inventory:
                 if container["service"] == "mariadb":
                     name = container["name"]
-                    server = instances[name]
-                    self.attach_volume(
-                        server.id, volume.id, f"instance-{name}"
-                    )
+                    if name in instances:
+                        server = instances[name]
+                        self.attach_volume(
+                            server.id, volume.id,
+                            f"instance-{name}"
+                        )
                     break
 
         for container in inventory:
@@ -253,7 +316,7 @@ class Provisioner:
                 raise Exception(
                     f"Cannot reach {name} via SSH at {target_ip}"
                 )
-  
+
         logger.info(
             f"Provisioning complete: {len(instances)} instances"
         )

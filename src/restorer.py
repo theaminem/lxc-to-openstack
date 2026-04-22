@@ -1,5 +1,6 @@
 import logging
 import time
+import subprocess
 import paramiko
 
 
@@ -12,18 +13,42 @@ class Restorer:
         self.config = config
 
     def _get_ssh_client(self, ip, private_key_path):
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(
+        jump_host = self.config["openstack"]["auth_url"].split("//")[1].split(":")[0]
+        jump_user = self.config["jump"]["username"]
+        jump_password = self.config["jump"]["password"]
+
+        jump_client = paramiko.SSHClient()
+        jump_client.set_missing_host_key_policy(
+            paramiko.AutoAddPolicy()
+        )
+        jump_client.connect(
+            hostname=jump_host,
+            username=jump_user,
+            password=jump_password,
+            timeout=10
+        )
+
+        jump_transport = jump_client.get_transport()
+        jump_channel = jump_transport.open_channel(
+            "direct-tcpip",
+            (ip, 22),
+            (jump_host, 0)
+        )
+
+        target_client = paramiko.SSHClient()
+        target_client.set_missing_host_key_policy(
             paramiko.AutoAddPolicy()
         )
         key = paramiko.RSAKey.from_private_key_file(private_key_path)
-        client.connect(
+        target_client.connect(
             hostname=ip,
             username="ubuntu",
             pkey=key,
+            sock=jump_channel,
             timeout=10
         )
-        return client, None
+
+        return target_client, jump_client
 
     def _run_remote(self, client, command, description=""):
         if description:
@@ -49,9 +74,23 @@ class Restorer:
             logger.debug(f"  OUTPUT: {output[:200]}")
         return output
 
+    def _fix_apt_sources(self, client):
+        self._run_remote(
+            client,
+            "sudo rm -f /etc/apt/sources.list.d/ubuntu.sources && "
+            "sudo mkdir -p /etc/cloud/cloud.cfg.d && "
+            "echo 'apt_preserve_sources_list: true' | sudo tee /etc/cloud/cloud.cfg.d/99-disable-apt.cfg > /dev/null && "
+            "echo 'deb http://archive.ubuntu.com/ubuntu noble main restricted universe multiverse' | sudo tee /etc/apt/sources.list > /dev/null && "
+            "echo 'deb http://archive.ubuntu.com/ubuntu noble-updates main restricted universe multiverse' | sudo tee -a /etc/apt/sources.list > /dev/null && "
+            "echo 'deb http://archive.ubuntu.com/ubuntu noble-security main restricted universe multiverse' | sudo tee -a /etc/apt/sources.list > /dev/null",
+            "Fixing apt sources"
+        )
+
     def restore_mariadb(self, ip, private_key_path):
         logger.info(f"Restoring MariaDB on {ip}...")
         client, jump = self._get_ssh_client(ip, private_key_path)
+
+        self._fix_apt_sources(client)
 
         self._run_remote(
             client,
@@ -148,6 +187,8 @@ class Restorer:
         logger.info(f"Restoring Apache on {ip}...")
         client, jump = self._get_ssh_client(ip, private_key_path)
 
+        self._fix_apt_sources(client)
+
         self._run_remote(
             client,
             "sudo apt update && sudo apt install -y "
@@ -199,6 +240,8 @@ class Restorer:
         logger.info(f"Restoring Backup service on {ip}...")
         client, jump = self._get_ssh_client(ip, private_key_path)
 
+        self._fix_apt_sources(client)
+
         self._run_remote(
             client,
             "sudo apt update && sudo apt install -y mariadb-client",
@@ -232,6 +275,8 @@ class Restorer:
     def restore_nfs(self, ip, private_key_path, shared_dirs):
         logger.info(f"Restoring NFS on {ip}...")
         client, jump = self._get_ssh_client(ip, private_key_path)
+
+        self._fix_apt_sources(client)
 
         self._run_remote(
             client,
@@ -282,6 +327,8 @@ class Restorer:
         logger.info(f"Restoring FTP ({server_type}) on {ip}...")
         client, jump = self._get_ssh_client(ip, private_key_path)
 
+        self._fix_apt_sources(client)
+
         self._run_remote(
             client,
             f"sudo apt update && sudo apt install -y {server_type}",
@@ -311,16 +358,19 @@ class Restorer:
         for line in users_output.split("\n"):
             parts = line.split(":")
             if len(parts) >= 3:
-                uid = int(parts[2])
-                username = parts[0]
-                if uid >= 1000 and username != "nobody":
-                    try:
-                        self._run_remote(
-                            client,
-                            f"sudo useradd -m {username} 2>/dev/null"
-                        )
-                    except Exception:
-                        pass
+                try:
+                    uid = int(parts[2])
+                    username = parts[0]
+                    if uid >= 1000 and username != "nobody":
+                        try:
+                            self._run_remote(
+                                client,
+                                f"sudo useradd -m {username} 2>/dev/null"
+                            )
+                        except Exception:
+                            pass
+                except ValueError:
+                    pass
 
         try:
             self._run_remote(
@@ -371,6 +421,17 @@ class Restorer:
                 if old_ip != new_ip:
                     ip_map[old_ip] = new_ip
 
+        subprocess.run(
+            "sudo sysctl -w net.ipv4.ip_forward=1",
+            shell=True, capture_output=True
+        )
+        subprocess.run(
+            "sudo iptables -t nat -C POSTROUTING -s 10.0.0.0/24 -o ens33 -j MASQUERADE 2>/dev/null || "
+            "sudo iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o ens33 -j MASQUERADE",
+            shell=True, capture_output=True
+        )
+        logger.info("NAT routing enabled for instances")
+
         for container in inventory:
             name = container["name"]
             service = container["service"]
@@ -387,3 +448,29 @@ class Restorer:
                 self.restore_apache(ip, private_key_path)
             elif service == "backup":
                 self.restore_backup(ip, private_key_path)
+            elif service == "nfs":
+                shared_dirs = []
+                if name in backup_paths:
+                    shared_dirs = backup_paths[name].get(
+                        "shared_dirs", []
+                    )
+                self.restore_nfs(ip, private_key_path, shared_dirs)
+            elif service == "ftp":
+                server_type = "vsftpd"
+                if name in backup_paths:
+                    server_type = backup_paths[name].get(
+                        "server_type", "vsftpd"
+                    )
+                self.restore_ftp(ip, private_key_path, server_type)
+
+        if ip_map:
+            logger.info("Updating IP configurations...")
+            for container in inventory:
+                name = container["name"]
+                if name not in ports:
+                    continue
+                port = ports[name]
+                ip = port.fixed_ips[0]["ip_address"]
+                self.update_ip_mappings(ip, private_key_path, ip_map)
+
+        logger.info("All restorations complete")

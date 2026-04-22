@@ -25,20 +25,24 @@ def main():
     print("=" * 50)
     print()
 
-    # Phase 0 : Initialisation
     config = load_config()
     logger = setup_logger(config)
     logger.info("Configuration loaded")
 
     username = input("OpenStack username: ")
     password = getpass.getpass("OpenStack password: ")
+    jump_user = input("VM-cible SSH username: ")
+    jump_password = getpass.getpass("VM-cible SSH password: ")
     logger.info(f"Authenticating as {username}")
+    config["jump"] = {
+        "username": jump_user,
+        "password": jump_password
+    }
 
     rollback = Rollback()
     conn = None
 
     try:
-        # Phase 1 : Scan
         logger.info("=" * 40)
         logger.info("PHASE 1: Scanning source infrastructure")
         logger.info("=" * 40)
@@ -57,7 +61,6 @@ def main():
         logger.info("PHASE 1 COMPLETE")
         ask_continue()
 
-        # Phase 2 : Network
         logger.info("=" * 40)
         logger.info("PHASE 2: Setting up OpenStack network")
         logger.info("=" * 40)
@@ -69,7 +72,6 @@ def main():
         logger.info("PHASE 2 COMPLETE")
         ask_continue()
 
-        # Phase 3-4 : Provisioning
         logger.info("=" * 40)
         logger.info("PHASE 3-4: Provisioning instances")
         logger.info("=" * 40)
@@ -81,7 +83,6 @@ def main():
         logger.info("PHASE 3-4 COMPLETE")
         ask_continue()
 
-        # Phase 5 : Backup
         logger.info("=" * 40)
         logger.info("PHASE 5: Backing up source data")
         logger.info("=" * 40)
@@ -90,7 +91,6 @@ def main():
         logger.info("PHASE 5 COMPLETE")
         ask_continue()
 
-        # Phase 6 : Transfer
         logger.info("=" * 40)
         logger.info("PHASE 6: Transferring data to instances")
         logger.info("=" * 40)
@@ -101,7 +101,6 @@ def main():
         logger.info("PHASE 6 COMPLETE")
         ask_continue()
 
-        # Phase 7 : Restoration
         logger.info("=" * 40)
         logger.info("PHASE 7: Installing and restoring services")
         logger.info("=" * 40)
@@ -112,7 +111,6 @@ def main():
         logger.info("PHASE 7 COMPLETE")
         ask_continue()
 
-        # Phase 8 : Validation
         logger.info("=" * 40)
         logger.info("PHASE 8: Validating migration")
         logger.info("=" * 40)
@@ -121,7 +119,6 @@ def main():
             inventory, backup_paths, private_key_path, ports
         )
 
-        # Resume final
         all_passed = all(results.values())
         if all_passed:
             logger.info("MIGRATION SUCCESSFUL")
