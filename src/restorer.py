@@ -133,7 +133,8 @@ class Restorer:
 
         self._run_remote(
             client,
-            "sudo apt update && sudo apt install -y mariadb-server",
+            "sudo DEBIAN_FRONTEND=noninteractive apt update && "
+            "sudo DEBIAN_FRONTEND=noninteractive apt install -y mariadb-server",
             "Installing mariadb-server"
         )
 
@@ -230,7 +231,8 @@ class Restorer:
 
         self._run_remote(
             client,
-            "sudo apt update && sudo apt install -y "
+            "sudo DEBIAN_FRONTEND=noninteractive apt update && "
+            "sudo DEBIAN_FRONTEND=noninteractive apt install -y "
             "apache2 php php-mysql libapache2-mod-php",
             "Installing Apache and PHP"
         )
@@ -239,6 +241,12 @@ class Restorer:
             client,
             "sudo tar xzf /tmp/apache_backup.tar.gz -C /",
             "Extracting Apache backup"
+        )
+
+        self._run_remote(
+            client,
+            "sudo a2enmod ssl rewrite headers 2>/dev/null || true",
+            "Enabling common modules"
         )
 
         modules_output = self._run_remote(
@@ -283,7 +291,8 @@ class Restorer:
 
         self._run_remote(
             client,
-            "sudo apt update && sudo apt install -y mariadb-client",
+            "sudo DEBIAN_FRONTEND=noninteractive apt update && "
+            "sudo DEBIAN_FRONTEND=noninteractive apt install -y mariadb-client",
             "Installing mariadb-client"
         )
 
@@ -319,7 +328,8 @@ class Restorer:
 
         self._run_remote(
             client,
-            "sudo apt update && sudo apt install -y nfs-kernel-server",
+            "sudo DEBIAN_FRONTEND=noninteractive apt update && "
+            "sudo DEBIAN_FRONTEND=noninteractive apt install -y nfs-kernel-server",
             "Installing NFS server"
         )
 
@@ -370,7 +380,8 @@ class Restorer:
 
         self._run_remote(
             client,
-            f"sudo apt update && sudo apt install -y {server_type}",
+            f"sudo DEBIAN_FRONTEND=noninteractive apt update && "
+            f"sudo DEBIAN_FRONTEND=noninteractive apt install -y {server_type}",
             f"Installing {server_type}"
         )
 
