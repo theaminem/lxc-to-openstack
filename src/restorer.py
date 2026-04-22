@@ -1,5 +1,4 @@
 import logging
-import time
 import subprocess
 import paramiko
 
@@ -75,15 +74,55 @@ class Restorer:
         return output
 
     def _fix_apt_sources(self, client):
+        source_ip = self.config["source"]["host"]
+        from src.scanner import run_command
+        mirror = run_command(
+            "grep -m1 '^deb ' /etc/apt/sources.list 2>/dev/null | awk '{print $2}'"
+        )
+        if not mirror:
+            mirror = run_command(
+                "grep -m1 'URIs:' /etc/apt/sources.list.d/*.sources 2>/dev/null | awk '{print $2}'"
+            )
+        if not mirror:
+            mirror = "http://archive.ubuntu.com/ubuntu"
+        mirror = mirror.rstrip("/")
+
+        codename = run_command("lsb_release -cs")
+        if not codename:
+            codename = "noble"
+
+        logger.info(f"Using mirror: {mirror} ({codename})")
+
         self._run_remote(
             client,
-            "sudo rm -f /etc/apt/sources.list.d/ubuntu.sources && "
-            "sudo mkdir -p /etc/cloud/cloud.cfg.d && "
-            "echo 'apt_preserve_sources_list: true' | sudo tee /etc/cloud/cloud.cfg.d/99-disable-apt.cfg > /dev/null && "
-            "echo 'deb http://archive.ubuntu.com/ubuntu noble main restricted universe multiverse' | sudo tee /etc/apt/sources.list > /dev/null && "
-            "echo 'deb http://archive.ubuntu.com/ubuntu noble-updates main restricted universe multiverse' | sudo tee -a /etc/apt/sources.list > /dev/null && "
-            "echo 'deb http://archive.ubuntu.com/ubuntu noble-security main restricted universe multiverse' | sudo tee -a /etc/apt/sources.list > /dev/null",
-            "Fixing apt sources"
+            "sudo rm -f /etc/apt/sources.list.d/ubuntu.sources",
+            "Removing cloud apt sources"
+        )
+        self._run_remote(
+            client,
+            "sudo mkdir -p /etc/cloud/cloud.cfg.d",
+        )
+        self._run_remote(
+            client,
+            "echo 'apt_preserve_sources_list: true' | sudo tee /etc/cloud/cloud.cfg.d/99-disable-apt.cfg > /dev/null",
+        )
+        self._run_remote(
+            client,
+            f"echo 'Acquire::http::Proxy \"http://{source_ip}:3142\";' | sudo tee /etc/apt/apt.conf.d/00proxy > /dev/null",
+            "Configuring APT proxy via source host"
+        )
+        self._run_remote(
+            client,
+            f"echo 'deb {mirror} {codename} main restricted universe multiverse' | sudo tee /etc/apt/sources.list > /dev/null",
+        )
+        self._run_remote(
+            client,
+            f"echo 'deb {mirror} {codename}-updates main restricted universe multiverse' | sudo tee -a /etc/apt/sources.list > /dev/null",
+        )
+        self._run_remote(
+            client,
+            f"echo 'deb {mirror} {codename}-security main restricted universe multiverse' | sudo tee -a /etc/apt/sources.list > /dev/null",
+            f"Writing apt sources ({mirror})"
         )
 
     def restore_mariadb(self, ip, private_key_path):
@@ -431,6 +470,12 @@ class Restorer:
             shell=True, capture_output=True
         )
         logger.info("NAT routing enabled for instances")
+
+        subprocess.run(
+            "sudo systemctl start apt-cacher-ng 2>/dev/null || true",
+            shell=True, capture_output=True
+        )
+        logger.info("APT proxy enabled on source host")
 
         for container in inventory:
             name = container["name"]
