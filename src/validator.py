@@ -120,9 +120,9 @@ class Validator:
 
         exit_code_cron, crontab = self._run_remote(
             client,
-            "crontab -l 2>/dev/null"
+            "sudo crontab -l 2>/dev/null"
         )
-
+        
         exit_code_dump, dump_path = self._run_remote(
             client,
             "which mysqldump"

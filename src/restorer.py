@@ -125,6 +125,7 @@ class Restorer:
             f"Writing apt sources ({mirror})"
         )
 
+
     def restore_mariadb(self, ip, private_key_path):
         logger.info(f"Restoring MariaDB on {ip}...")
         client, jump = self._get_ssh_client(ip, private_key_path)
@@ -138,66 +139,82 @@ class Restorer:
             "Installing mariadb-server"
         )
 
-        self._run_remote(
-            client,
-            "sudo systemctl stop mariadb",
-            "Stopping MariaDB to setup volume"
-        )
+        
+        stdin_vdb, stdout_vdb, stderr_vdb = client.exec_command("ls /dev/vdb 2>/dev/null")
+        vdb_exists = stdout_vdb.channel.recv_exit_status() == 0
+        
+        if vdb_exists:
+            logger.info("  Cinder volume detected, configuring...")
 
-        self._run_remote(
-            client,
-            "sudo mkfs.ext4 /dev/vdb",
-            "Formatting Cinder volume"
-        )
+            self._run_remote(
+                client,
+                "sudo systemctl stop mariadb",
+                "Stopping MariaDB to setup volume"
+            )
 
-        self._run_remote(
-            client,
-            "sudo mkdir -p /mnt/mariadb-data",
-            "Creating mount point"
-        )
+            self._run_remote(
+                client,
+                "sudo mkfs.ext4 -F /dev/vdb",
+                "Formatting Cinder volume"
+            )
 
-        self._run_remote(
-            client,
-            "sudo mount /dev/vdb /mnt/mariadb-data",
-            "Mounting Cinder volume"
-        )
+            self._run_remote(
+                client,
+                "sudo mkdir -p /mnt/mariadb-data",
+                "Creating mount point"
+            )
 
-        self._run_remote(
-            client,
-            "sudo cp -a /var/lib/mysql/* /mnt/mariadb-data/",
-            "Copying MariaDB data to volume"
-        )
+            self._run_remote(
+                client,
+                "sudo mount /dev/vdb /mnt/mariadb-data",
+                "Mounting Cinder volume"
+            )
 
-        self._run_remote(
-            client,
-            "sudo umount /mnt/mariadb-data",
-            "Unmounting temporary mount"
-        )
+            self._run_remote(
+                client,
+                "sudo cp -a /var/lib/mysql/* /mnt/mariadb-data/",
+                "Copying MariaDB data to volume"
+            )
 
-        self._run_remote(
-            client,
-            "sudo mount /dev/vdb /var/lib/mysql",
-            "Mounting volume to /var/lib/mysql"
-        )
+            self._run_remote(
+                client,
+                "sudo umount /mnt/mariadb-data",
+                "Unmounting temporary mount"
+            )
 
-        self._run_remote(
-            client,
-            "sudo chown -R mysql:mysql /var/lib/mysql",
-            "Fixing permissions"
-        )
+            self._run_remote(
+                client,
+                "sudo mount /dev/vdb /var/lib/mysql",
+                "Mounting volume to /var/lib/mysql"
+            )
 
-        self._run_remote(
-            client,
-            "echo '/dev/vdb /var/lib/mysql ext4 defaults 0 2' "
-            "| sudo tee -a /etc/fstab",
-            "Adding volume to fstab for auto-mount"
-        )
+            self._run_remote(
+                client,
+                "sudo chown -R mysql:mysql /var/lib/mysql",
+                "Fixing permissions"
+            )
 
-        self._run_remote(
-            client,
-            "sudo systemctl start mariadb",
-            "Starting MariaDB on Cinder volume"
-        )
+            self._run_remote(
+                client,
+                "echo '/dev/vdb /var/lib/mysql ext4 defaults 0 2' "
+                "| sudo tee -a /etc/fstab",
+                "Adding volume to fstab for auto-mount"
+            )
+
+            self._run_remote(
+                client,
+                "sudo systemctl start mariadb",
+                "Starting MariaDB on Cinder volume"
+            )
+        else:
+            logger.warning(
+                "  No Cinder volume found, using instance disk"
+            )
+            self._run_remote(
+                client,
+                "sudo systemctl start mariadb",
+                "Starting MariaDB on instance disk"
+            )
 
         self._run_remote(
             client,
@@ -221,7 +238,7 @@ class Restorer:
         client.close()
         if jump:
             jump.close()
-        logger.info("MariaDB restoration complete (Cinder volume)")
+        logger.info("MariaDB restoration complete") 
 
     def restore_apache(self, ip, private_key_path):
         logger.info(f"Restoring Apache on {ip}...")
