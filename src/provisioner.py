@@ -215,7 +215,7 @@ class Provisioner:
         logger.info(f"Instance {name} is ACTIVE")
         return server
 
-    def wait_for_ssh(self, ip, private_key_path, timeout=120):
+    def wait_for_ssh(self, ip, private_key_path, timeout=300):
         logger.info(f"Waiting for SSH on {ip} (via jump host)...")
         jump_host = self.config["openstack"]["auth_url"].split("//")[1].split(":")[0]
         jump_user = self.config["jump"]["username"]

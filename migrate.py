@@ -13,11 +13,15 @@ from src.validator import Validator
 
 
 def ask_continue():
-    response = input("\nContinue to next phase? (y/n): ")
-    if response.lower() != "y":
-        print("Migration paused. Relaunch to continue.")
-        sys.exit(0)
-
+    while True:
+        response = input("\nContinue to next phase? (y/n): ").strip().lower()
+        if response == "y":
+            return
+        elif response == "n":
+            print("Migration paused. Relaunch to continue.")
+            sys.exit(0)
+        else:
+            print("Please type 'y' or 'n'")
 
 def main():
     print("=" * 50)

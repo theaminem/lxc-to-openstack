@@ -74,24 +74,39 @@ class Restorer:
         return output
 
     def _fix_apt_sources(self, client):
-        source_ip = self.config["source"]["host"]
-        from src.scanner import run_command
-        mirror = run_command(
-            "grep -m1 '^deb ' /etc/apt/sources.list 2>/dev/null | awk '{print $2}'"
-        )
-        if not mirror:
-            mirror = run_command(
-                "grep -m1 'URIs:' /etc/apt/sources.list.d/*.sources 2>/dev/null | awk '{print $2}'"
-            )
-        if not mirror:
-            mirror = "http://archive.ubuntu.com/ubuntu"
-        mirror = mirror.rstrip("/")
+        jump_host = self.config["openstack"]["auth_url"].split("//")[1].split(":")[0]
+        jump_user = self.config["jump"]["username"]
+        jump_password = self.config["jump"]["password"]
 
+        from src.scanner import run_command
         codename = run_command("lsb_release -cs")
         if not codename:
             codename = "noble"
 
-        logger.info(f"Using mirror: {mirror} ({codename})")
+        cible_client = paramiko.SSHClient()
+        cible_client.set_missing_host_key_policy(
+            paramiko.AutoAddPolicy()
+        )
+        cible_client.connect(
+            hostname=jump_host,
+            username=jump_user,
+            password=jump_password,
+            timeout=10
+        )
+        stdin, stdout, stderr = cible_client.exec_command(
+            "dig +short dz.archive.ubuntu.com | head -1"
+        )
+        mirror_ip = stdout.read().decode().strip()
+        stdin, stdout, stderr = cible_client.exec_command(
+            "dig +short security.ubuntu.com | head -1"
+        )
+        security_ip = stdout.read().decode().strip()
+        cible_client.close()
+
+        logger.info(
+            f"Mirror IPs from vm-cible: "
+            f"dz.archive={mirror_ip}, security={security_ip}"
+        )
 
         self._run_remote(
             client,
@@ -104,27 +119,50 @@ class Restorer:
         )
         self._run_remote(
             client,
-            "echo 'apt_preserve_sources_list: true' | sudo tee /etc/cloud/cloud.cfg.d/99-disable-apt.cfg > /dev/null",
+            "echo 'apt_preserve_sources_list: true' | "
+            "sudo tee /etc/cloud/cloud.cfg.d/99-disable-apt.cfg "
+            "> /dev/null",
         )
         self._run_remote(
             client,
-            f"echo 'Acquire::http::Proxy \"http://{source_ip}:3142\";' | sudo tee /etc/apt/apt.conf.d/00proxy > /dev/null",
-            "Configuring APT proxy via source host"
+            "sudo rm -f /etc/apt/apt.conf.d/00proxy",
+            "Removing old proxy config"
+        )
+        if mirror_ip:
+            self._run_remote(
+                client,
+                f"echo '{mirror_ip} dz.archive.ubuntu.com' | "
+                f"sudo tee -a /etc/hosts > /dev/null",
+                f"Pinning dz.archive.ubuntu.com to {mirror_ip}"
+            )
+        if security_ip:
+            self._run_remote(
+                client,
+                f"echo '{security_ip} security.ubuntu.com' | "
+                f"sudo tee -a /etc/hosts > /dev/null",
+                f"Pinning security.ubuntu.com to {security_ip}"
+            )
+        self._run_remote(
+            client,
+            f"echo 'deb http://dz.archive.ubuntu.com/ubuntu "
+            f"{codename} main restricted universe multiverse' | "
+            f"sudo tee /etc/apt/sources.list > /dev/null",
         )
         self._run_remote(
             client,
-            f"echo 'deb {mirror} {codename} main restricted universe multiverse' | sudo tee /etc/apt/sources.list > /dev/null",
+            f"echo 'deb http://dz.archive.ubuntu.com/ubuntu "
+            f"{codename}-updates main restricted universe "
+            f"multiverse' | "
+            f"sudo tee -a /etc/apt/sources.list > /dev/null",
         )
         self._run_remote(
             client,
-            f"echo 'deb {mirror} {codename}-updates main restricted universe multiverse' | sudo tee -a /etc/apt/sources.list > /dev/null",
+            f"echo 'deb http://security.ubuntu.com/ubuntu "
+            f"{codename}-security main restricted universe "
+            f"multiverse' | "
+            f"sudo tee -a /etc/apt/sources.list > /dev/null",
+            f"Writing apt sources ({codename})"
         )
-        self._run_remote(
-            client,
-            f"echo 'deb {mirror} {codename}-security main restricted universe multiverse' | sudo tee -a /etc/apt/sources.list > /dev/null",
-            f"Writing apt sources ({mirror})"
-        )
-
 
     def restore_mariadb(self, ip, private_key_path):
         logger.info(f"Restoring MariaDB on {ip}...")
@@ -135,14 +173,16 @@ class Restorer:
         self._run_remote(
             client,
             "sudo DEBIAN_FRONTEND=noninteractive apt update && "
-            "sudo DEBIAN_FRONTEND=noninteractive apt install -y mariadb-server",
+            "sudo DEBIAN_FRONTEND=noninteractive apt install "
+            "-y mariadb-server",
             "Installing mariadb-server"
         )
 
-        
-        stdin_vdb, stdout_vdb, stderr_vdb = client.exec_command("ls /dev/vdb 2>/dev/null")
+        stdin_vdb, stdout_vdb, stderr_vdb = client.exec_command(
+            "ls /dev/vdb 2>/dev/null"
+        )
         vdb_exists = stdout_vdb.channel.recv_exit_status() == 0
-        
+
         if vdb_exists:
             logger.info("  Cinder volume detected, configuring...")
 
@@ -224,6 +264,18 @@ class Restorer:
 
         self._run_remote(
             client,
+            "sudo mysql -u root -e \""
+            "CREATE USER IF NOT EXISTS 'appuser'@'%' "
+            "IDENTIFIED BY 'password';"
+            "GRANT ALL PRIVILEGES ON *.* TO 'appuser'@'%';"
+            "DROP USER IF EXISTS 'appuser'@'10.0.3.20';"
+            "DROP USER IF EXISTS 'appuser'@'10.0.3.30';"
+            "FLUSH PRIVILEGES;\"",
+            "Fixing user grants for new network"
+        )
+
+        self._run_remote(
+            client,
             "sudo sed -i 's/bind-address.*/bind-address = 0.0.0.0/' "
             "/etc/mysql/mariadb.conf.d/50-server.cnf",
             "Setting bind-address to 0.0.0.0"
@@ -238,7 +290,7 @@ class Restorer:
         client.close()
         if jump:
             jump.close()
-        logger.info("MariaDB restoration complete") 
+        logger.info("MariaDB restoration complete")
 
     def restore_apache(self, ip, private_key_path):
         logger.info(f"Restoring Apache on {ip}...")
@@ -249,8 +301,8 @@ class Restorer:
         self._run_remote(
             client,
             "sudo DEBIAN_FRONTEND=noninteractive apt update && "
-            "sudo DEBIAN_FRONTEND=noninteractive apt install -y "
-            "apache2 php php-mysql libapache2-mod-php",
+            "sudo DEBIAN_FRONTEND=noninteractive apt install "
+            "-y apache2 php php-mysql libapache2-mod-php",
             "Installing Apache and PHP"
         )
 
@@ -258,6 +310,12 @@ class Restorer:
             client,
             "sudo tar xzf /tmp/apache_backup.tar.gz -C /",
             "Extracting Apache backup"
+        )
+
+        self._run_remote(
+            client,
+            "sudo rm -f /var/www/html/index.html",
+            "Removing default Apache page"
         )
 
         self._run_remote(
@@ -309,7 +367,8 @@ class Restorer:
         self._run_remote(
             client,
             "sudo DEBIAN_FRONTEND=noninteractive apt update && "
-            "sudo DEBIAN_FRONTEND=noninteractive apt install -y mariadb-client",
+            "sudo DEBIAN_FRONTEND=noninteractive apt install "
+            "-y mariadb-client",
             "Installing mariadb-client"
         )
 
@@ -346,7 +405,8 @@ class Restorer:
         self._run_remote(
             client,
             "sudo DEBIAN_FRONTEND=noninteractive apt update && "
-            "sudo DEBIAN_FRONTEND=noninteractive apt install -y nfs-kernel-server",
+            "sudo DEBIAN_FRONTEND=noninteractive apt install "
+            "-y nfs-kernel-server",
             "Installing NFS server"
         )
 
@@ -398,7 +458,8 @@ class Restorer:
         self._run_remote(
             client,
             f"sudo DEBIAN_FRONTEND=noninteractive apt update && "
-            f"sudo DEBIAN_FRONTEND=noninteractive apt install -y {server_type}",
+            f"sudo DEBIAN_FRONTEND=noninteractive apt install "
+            f"-y {server_type}",
             f"Installing {server_type}"
         )
 
@@ -432,7 +493,8 @@ class Restorer:
                         try:
                             self._run_remote(
                                 client,
-                                f"sudo useradd -m {username} 2>/dev/null"
+                                f"sudo useradd -m {username} "
+                                f"2>/dev/null"
                             )
                         except Exception:
                             pass
@@ -468,7 +530,8 @@ class Restorer:
                 client,
                 f"sudo grep -rl '{old_ip}' /etc/ /var/www/ "
                 f"/root/ 2>/dev/null | while read f; do "
-                f"sudo sed -i 's/{old_ip}/{new_ip}/g' \"$f\"; done",
+                f"sudo sed -i 's/{old_ip}/{new_ip}/g' "
+                f"\"$f\"; done",
                 f"Replacing {old_ip} -> {new_ip}"
             )
 
@@ -493,17 +556,14 @@ class Restorer:
             shell=True, capture_output=True
         )
         subprocess.run(
-            "sudo iptables -t nat -C POSTROUTING -s 10.0.0.0/24 -o ens33 -j MASQUERADE 2>/dev/null || "
-            "sudo iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o ens33 -j MASQUERADE",
+            "sudo iptables -t nat -C POSTROUTING "
+            "-s 10.0.0.0/24 -o ens33 -j MASQUERADE "
+            "2>/dev/null || "
+            "sudo iptables -t nat -A POSTROUTING "
+            "-s 10.0.0.0/24 -o ens33 -j MASQUERADE",
             shell=True, capture_output=True
         )
         logger.info("NAT routing enabled for instances")
-
-        subprocess.run(
-            "sudo systemctl start apt-cacher-ng 2>/dev/null || true",
-            shell=True, capture_output=True
-        )
-        logger.info("APT proxy enabled on source host")
 
         for container in inventory:
             name = container["name"]
@@ -544,6 +604,8 @@ class Restorer:
                     continue
                 port = ports[name]
                 ip = port.fixed_ips[0]["ip_address"]
-                self.update_ip_mappings(ip, private_key_path, ip_map)
+                self.update_ip_mappings(
+                    ip, private_key_path, ip_map
+                )
 
         logger.info("All restorations complete")
