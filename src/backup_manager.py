@@ -25,26 +25,44 @@ class BackupManager:
         db_list = [
             db.strip() for db in databases.split("\n")
             if db.strip() and db.strip() not in
-            ["information_schema", "mysql", "performance_schema", "sys"]
+            ["information_schema", "mysql", "performance_schema"]
+            and db.strip() != "sys"
         ]
         db_names = " ".join(db_list)
+
+        if not db_names:
+            raise Exception(
+                "No application databases found to backup"
+            )
+
         logger.info(f"Dumping databases: {db_names}")
 
         run_command(
             f"sudo lxc-attach -n {name} -- "
-            f"mysqldump -u root --single-transaction "
+            f"bash -c 'mysqldump -u root --single-transaction "
             f"--routines --triggers --events "
-            f"--databases {db_names} > {dump_path}"
+            f"--databases {db_names}' > {dump_path}"
         )
+
+        dump_size = os.path.getsize(dump_path)
+        if dump_size == 0:
+            raise Exception(
+                "MariaDB dump is empty (0 bytes). "
+                "Backup failed, aborting migration."
+            )
+
         users_path = os.path.join(self.backup_dir, "mariadb_users.sql")
         run_command(
             f"sudo lxc-attach -n {name} -- "
-            f"bash -c 'mysqldump -u root --single-transaction "
-            f"--routines --triggers --events "
-            f"--databases $(mysql -u root -N -e \"SHOW DATABASES\" "
-            f"| grep -vE \"information_schema|mysql|performance_schema|sys\") "
-            f"' > {dump_path}"
+            f"mysql -u root -N -e "
+            f"\"SELECT CONCAT('CREATE USER IF NOT EXISTS ', "
+            f"QUOTE(User), '@', QUOTE(Host), "
+            f"' IDENTIFIED BY PASSWORD ', QUOTE(Password), ';') "
+            f"FROM mysql.user WHERE User NOT IN "
+            f"('root', 'mariadb.sys', 'mysql', '')\" "
+            f"> {users_path}"
         )
+
         self._verify_file(dump_path, "MariaDB dump")
         logger.info(
             f"MariaDB backup complete: {self._file_size(dump_path)}"
