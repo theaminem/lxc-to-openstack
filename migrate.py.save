@@ -113,101 +113,18 @@ def main():
             inventory, backup_paths, private_key_path, ports,
             net_manager.network_mode
         )
-        logger.info("PHASE 7 COMPLETE")
-
-        if net_manager.network_mode == "tenant":
-            logger.info("=" * 40)
-            logger.info("Assigning floating IP to Apache...")
-            logger.info("=" * 40)
-            ext_network = conn.network.find_network(
-                config["network"].get("external_network", "provider")
-            )
-            for container in inventory:
-                if container["service"] == "apache":
-                    name = container["name"]
-                    if name in ports:
-                        server = conn.compute.find_server(
-                            f"instance-{name}"
-                        )
-                        existing_fips = list(
-                            conn.network.ips(
-                                port_id=ports[name].id
-                            )
-                        )
-                        if existing_fips:
-                            fip = existing_fips[0]
-                            logger.info(
-                                f"Floating IP already assigned: "
-                                f"{fip.floating_ip_address}"
-                            )
-                        else:
-                            fip = conn.network.create_ip(
-                                floating_network_id=ext_network.id,
-                                port_id=ports[name].id
-                            )
-                            logger.info(
-                                f"Floating IP assigned to Apache: "
-                                f"{fip.floating_ip_address}"
-                            )
-                        logger.info(
-                            f"Access application at: "
-                            f"http://{fip.floating_ip_address}"
-                        )
-                    break
-
-        ask_continue()
-
-        logger.info("=" * 40)
-        logger.info("PHASE 8: Validating migration")
+        
         logger.info("=" * 40)
         validator = Validator(config)
         results = validator.validate_all(
             inventory, backup_paths, private_key_path, ports
         )
-        
+
         all_passed = all(results.values())
         if all_passed:
             logger.info("MIGRATION SUCCESSFUL")
         else:
             logger.warning("MIGRATION COMPLETED WITH FAILURES")
-
-        logger.info("=" * 40)
-        logger.info("INSTANCE SUMMARY")
-        logger.info("=" * 40)
-        for container in inventory:
-            name = container["name"]
-            if name in ports:
-                ip = ports[name].fixed_ips[0]["ip_address"]
-                logger.info(f"  {name:12s} : {ip}")
-
-        if net_manager.network_mode == "tenant":
-            ext_network = conn.network.find_network(
-                config["network"].get(
-                    "external_network", "provider"
-                )
-            )
-            fips = list(conn.network.ips(
-                floating_network_id=ext_network.id,
-                project_id=conn.current_project_id
-            ))
-            if fips:
-                logger.info("")
-                logger.info("EXTERNAL ACCESS:")
-                for fip in fips:
-                    logger.info(
-                        f"  http://{fip.floating_ip_address}"
-                    )
-        else:
-            for container in inventory:
-                if container["service"] == "apache":
-                    name = container["name"]
-                    if name in ports:
-                        ip = ports[name].fixed_ips[0]["ip_address"]
-                        logger.info("")
-                        logger.info(f"APPLICATION: http://{ip}")
-                    break
-
-        logger.info("=" * 40)
 
     except Exception as e:
         logger.error(f"Migration failed: {e}")

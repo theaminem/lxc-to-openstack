@@ -12,7 +12,7 @@ class NetworkManager:
         self.config = config
         self.rollback = rollback
         self.conn = None
-        self.use_provider = config["network"].get("use_provider", False)
+        self.network_mode = None
 
     def connect(self, username, password):
         os_config = self.config["openstack"]
@@ -27,83 +27,118 @@ class NetworkManager:
         )
         logger.info("Connected to OpenStack")
         return self.conn
+    def _try_tenant_network(self, source_cidr, source_gateway):
+        base = source_cidr.split("/")[0].rsplit(".", 1)[0]
+        try: 
+            network = self.conn.network.find_network("migration-net")
+            if network:
+                logger.info(
+                    "Network migration-net already exists, reusing"
+                )
+            else:
+                network = self.conn.network.create_network(
+                    name="migration-net"
+                )
+                self.rollback.register(
+                    "network", network.id, "migration-net"
+                )
+                logger.info("Created tenant network: migration-net")
 
-    def find_or_create_network(self):
-        net_config = self.config["network"]
-        name = net_config["name"]
+            subnet = self.conn.network.find_subnet("migration-subnet")
+            if subnet:
+                logger.info(
+                    "Subnet migration-subnet already exists, reusing"
+                )
+            else:
+                subnet = self.conn.network.create_subnet(
+                    name="migration-subnet",
+                    network_id=network.id,
+                    cidr=source_cidr,
+                    ip_version=4,
+                    gateway_ip=source_gateway,
+                    dns_nameservers=["8.8.8.8"],
+                    allocation_pools=[{
+                        "start": base + ".10",
+                        "end": base + ".250"
+                    }],
+                    enable_dhcp=False
+                )
+                self.rollback.register(
+                    "subnet", subnet.id, "migration-subnet"
+                )
+                logger.info(
+                    f"Created subnet: migration-subnet ({source_cidr})"
+                )
 
-        existing = self.conn.network.find_network(name)
-        if existing:
-            logger.info(f"Network {name} already exists, reusing")
-            return existing
+            ext_network_name = self.config["network"].get(
+                "external_network", "provider"
+            )
+            ext_network = self.conn.network.find_network(
+                ext_network_name
+            )
 
-        network = self.conn.network.create_network(name=name)
-        self.rollback.register("network", network.id, name)
-        logger.info(f"Created network: {name}")
-        return network
+            router = self.conn.network.find_router("migration-router")
+            if router:
+                logger.info(
+                    "Router migration-router already exists, reusing"
+                )
+            else:
+                if not ext_network:
+                    raise Exception(
+                        f"External network {ext_network_name} not found"
+                    )
+                router = self.conn.network.create_router(
+                    name="migration-router",
+                    external_gateway_info={
+                        "network_id": ext_network.id
+                    }
+                )
+                self.rollback.register(
+                    "router", router.id, "migration-router"
+                )
+                self.conn.network.add_interface_to_router(
+                    router.id, subnet_id=subnet.id
+                )
+                logger.info("Created router: migration-router")
 
-    def find_or_create_subnet(self, network_id):
-        net_config = self.config["network"]
-        name = net_config["subnet_name"]
-
-        existing = self.conn.network.find_subnet(name)
-        if existing:
-            logger.info(f"Subnet {name} already exists, reusing")
-            return existing
-
-        subnet = self.conn.network.create_subnet(
-            name=name,
-            network_id=network_id,
-            cidr=net_config["cidr"],
-            ip_version=4,
-            gateway_ip=net_config["gateway"],
-            allocation_pools=[{
-                "start": net_config["pool_start"],
-                "end": net_config["pool_end"]
-            }]
-        )
-        self.rollback.register("subnet", subnet.id, name)
-        logger.info(f"Created subnet: {name} ({net_config['cidr']})")
-        return subnet
-
-    def find_or_create_router(self, subnet_id):
-        net_config = self.config["network"]
-        router_name = net_config["router_name"]
-        ext_network_name = net_config["external_network"]
-
-        try:
-            existing = self.conn.network.find_router(router_name)
-        except Exception:
-            existing = None
-
-        if existing:
+            self.network_mode = "tenant"
             logger.info(
-                f"Router {router_name} already exists, reusing"
+                "Tenant network mode: instances keep original IPs"
             )
-            return existing
+            return network, subnet
 
-        ext_network = self.conn.network.find_network(ext_network_name)
-        if not ext_network:
+        except Exception as e:
+            logger.warning(
+                f"Tenant network failed: {e}"
+            )
+            logger.info("Falling back to provider network...")
+            return None, None
+
+    def _use_provider_network(self):
+        net_config = self.config["network"]
+        provider_name = net_config.get(
+            "external_network", "provider"
+        )
+
+        network = self.conn.network.find_network(provider_name)
+        if not network:
             raise Exception(
-                f"External network {ext_network_name} not found"
+                f"Provider network {provider_name} not found"
             )
 
-        router = self.conn.network.create_router(
-            name=router_name,
-            external_gateway_info={"network_id": ext_network.id}
+        subnets = list(
+            self.conn.network.subnets(network_id=network.id)
         )
-        self.rollback.register("router", router.id, router_name)
-        logger.info(f"Created router: {router_name}")
+        if not subnets:
+            raise Exception("No subnet on provider network")
+        subnet = subnets[0]
 
-        self.conn.network.add_interface_to_router(
-            router.id,
-            subnet_id=subnet_id
-        )
+        self.network_mode = "provider"
         logger.info(
-            f"Attached subnet to router {router_name}"
+            f"Provider network mode: {provider_name} "
+            f"(IPs will be remapped)"
         )
-
-        return router
+        return network, subnet
 
     def find_or_create_port(self, network_id, subnet_id, ip,
                             port_name, security_groups):
@@ -138,7 +173,9 @@ class NetworkManager:
     def find_or_create_security_group(self, name, description):
         existing = self.conn.network.find_security_group(name)
         if existing:
-            logger.info(f"Security group {name} already exists, reusing")
+            logger.info(
+                f"Security group {name} already exists, reusing"
+            )
             return existing
 
         sg = self.conn.network.create_security_group(
@@ -180,9 +217,7 @@ class NetworkManager:
             f"{port_min}-{port_max} from {remote_ip or 'any'}"
         )
 
-    def setup_security_groups(self):
-        cidr = self.config["network"]["cidr"]
-
+    def setup_security_groups(self, cidr):
         sg_ssh = self.find_or_create_security_group(
             "sg-ssh", "Allow SSH access"
         )
@@ -222,6 +257,11 @@ class NetworkManager:
         )
         self.add_sg_rule(sg_ftp.id, "ingress", "tcp", 21, 21)
 
+        sg_icmp = self.find_or_create_security_group(
+            "sg-icmp", "Allow ICMP ping"
+        )
+        self.add_sg_rule(sg_icmp.id, "ingress", "icmp", None, None)
+
         logger.info("All security groups configured")
 
         return {
@@ -230,57 +270,46 @@ class NetworkManager:
             "mariadb": sg_mariadb,
             "backup": sg_backup,
             "nfs": sg_nfs,
-            "ftp": sg_ftp
+            "ftp": sg_ftp,
+            "icmp": sg_icmp
         }
 
     def get_security_groups_for_service(self, service,
                                          security_groups):
         sg_ssh = security_groups["ssh"]
+        sg_icmp = security_groups["icmp"]
 
         if service == "mariadb":
-            return [sg_ssh, security_groups["mariadb"]]
+            return [sg_ssh, sg_icmp, security_groups["mariadb"]]
         elif service == "apache":
-            return [sg_ssh, security_groups["http"]]
+            return [sg_ssh, sg_icmp, security_groups["http"]]
         elif service == "backup":
-            return [sg_ssh, security_groups["backup"]]
+            return [sg_ssh, sg_icmp, security_groups["backup"]]
         elif service == "nfs":
-            return [sg_ssh, security_groups["nfs"]]
+            return [sg_ssh, sg_icmp, security_groups["nfs"]]
         elif service == "ftp":
-            return [sg_ssh, security_groups["ftp"]]
+            return [sg_ssh, sg_icmp, security_groups["ftp"]]
         else:
-            return [sg_ssh]
+            return [sg_ssh, sg_icmp]
 
     def setup_migration_network(self, inventory):
-        security_groups = self.setup_security_groups()
+        source_cidr = self.config["source"]["bridge_subnet"]
+        parts = source_cidr.split("/")
+        base = parts[0].rsplit(".", 1)[0]
+        source_gateway = base + ".1"
+
+        security_groups = self.setup_security_groups(source_cidr)
+
+        network, subnet = self._try_tenant_network(
+            source_cidr, source_gateway
+        )
+
+        if network is None:
+            network, subnet = self._use_provider_network()
 
         known_services = [
             "mariadb", "apache", "backup", "nfs", "ftp"
         ]
-
-        net_config = self.config["network"]
-
-        if self.use_provider:
-            network = self.conn.network.find_network(
-                net_config["name"]
-            )
-            if not network:
-                raise Exception(
-                    f"Provider network {net_config['name']} not found"
-                )
-            subnets = list(
-                self.conn.network.subnets(network_id=network.id)
-            )
-            if not subnets:
-                raise Exception("No subnet on provider network")
-            subnet = subnets[0]
-            logger.info(
-                f"Using provider network: {net_config['name']}"
-            )
-        else:
-            network = self.find_or_create_network()
-            subnet = self.find_or_create_subnet(network.id)
-            router = self.find_or_create_router(subnet.id)
-            logger.info("Tenant network created with router")
 
         ports = {}
         for container in inventory:
@@ -299,18 +328,19 @@ class NetworkManager:
                 service, security_groups
             )
 
-            if self.use_provider:
-                port = self.find_or_create_port(
-                    network.id, subnet.id, None, port_name, sgs
-                )
-            else:
+            if self.network_mode == "tenant":
                 ip = container["ip"]
                 port = self.find_or_create_port(
                     network.id, subnet.id, ip, port_name, sgs
                 )
+            else:
+                port = self.find_or_create_port(
+                    network.id, subnet.id, None, port_name, sgs
+                )
             ports[name] = port
 
         logger.info(
-            f"Network setup complete: {len(ports)} ports created"
+            f"Network setup complete: {len(ports)} ports created "
+            f"(mode: {self.network_mode})"
         )
         return network, subnet, ports

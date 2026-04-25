@@ -228,6 +228,110 @@ class Provisioner:
 
         return server
 
+    def _is_tenant_ip(self, ip):
+        source_subnet = self.config.get("source", {}).get("bridge_subnet", "")
+        if source_subnet.startswith("10.0.3."):
+            return ip.startswith("10.0.3.")
+        return ip.startswith("10.0.3.")
+
+    def _copy_key_to_jump_host(self, jump_client, private_key_path):
+        remote_key_path = "/tmp/migration-key"
+
+        sftp = jump_client.open_sftp()
+        sftp.put(private_key_path, remote_key_path)
+        sftp.close()
+
+        stdin, stdout, stderr = jump_client.exec_command(
+            f"chmod 600 {remote_key_path}"
+        )
+        stdout.channel.recv_exit_status()
+
+        return remote_key_path
+
+    def _get_router_namespace(self, jump_client):
+        stdin, stdout, stderr = jump_client.exec_command(
+            "ip netns | awk '/qrouter/ {print $1; exit}'"
+        )
+        namespace = stdout.read().decode().strip()
+
+        if not namespace:
+            raise Exception("No qrouter namespace found on vm-cible")
+
+        return namespace
+
+    def _wait_for_ssh_via_router_namespace(
+        self,
+        jump_client,
+        ip,
+        private_key_path
+    ):
+        remote_key_path = self._copy_key_to_jump_host(
+            jump_client,
+            private_key_path
+        )
+
+        namespace = self._get_router_namespace(jump_client)
+        
+        escaped_password = self.config["jump"]["password"].replace("'", "'\"'\"'")
+
+        command = (
+            f"echo '{escaped_password}' | sudo -S "
+            f"ip netns exec {namespace} "
+            f"ssh -o StrictHostKeyChecking=no "
+            f"-o UserKnownHostsFile=/dev/null "
+            f"-o ConnectTimeout=5 "
+            f"-i {remote_key_path} "
+            f"ubuntu@{ip} hostname"
+        )
+
+        stdin, stdout, stderr = jump_client.exec_command(command)
+        exit_code = stdout.channel.recv_exit_status()
+
+        output = stdout.read().decode().strip()
+        errors = stderr.read().decode().strip()
+
+        if exit_code == 0:
+            logger.debug(f"Tenant SSH output for {ip}: {output}")
+            logger.info(f"SSH ready on {ip} via {namespace}")
+            return True
+
+        if errors:
+            logger.debug(f"Tenant SSH error for {ip}: {errors}")
+
+        return False
+
+    def _wait_for_ssh_via_direct_tunnel(
+        self,
+        jump_client,
+        ip,
+        private_key_path
+    ):
+        jump_host = self.config["openstack"]["auth_url"].split("//")[1].split(":")[0]
+        jump_transport = jump_client.get_transport()
+
+        jump_channel = jump_transport.open_channel(
+            "direct-tcpip",
+            (ip, 22),
+            (jump_host, 0)
+        )
+
+        target_client = paramiko.SSHClient()
+        target_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        key = paramiko.RSAKey.from_private_key_file(private_key_path)
+
+        target_client.connect(
+            hostname=ip,
+            username="ubuntu",
+            pkey=key,
+            sock=jump_channel,
+            timeout=5
+        )
+
+        target_client.close()
+        logger.info(f"SSH ready on {ip}")
+        return True
+
     def wait_for_ssh(self, ip, private_key_path, timeout=300):
         logger.info(f"Waiting for SSH on {ip} via jump host...")
 
@@ -238,6 +342,8 @@ class Provisioner:
         start = time.time()
 
         while time.time() - start < timeout:
+            jump_client = None
+
             try:
                 jump_client = paramiko.SSHClient()
                 jump_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -249,39 +355,33 @@ class Provisioner:
                     timeout=5
                 )
 
-                jump_transport = jump_client.get_transport()
+                if self._is_tenant_ip(ip):
+                    ssh_ready = self._wait_for_ssh_via_router_namespace(
+                        jump_client,
+                        ip,
+                        private_key_path
+                    )
+                else:
+                    ssh_ready = self._wait_for_ssh_via_direct_tunnel(
+                        jump_client,
+                        ip,
+                        private_key_path
+                    )
 
-                jump_channel = jump_transport.open_channel(
-                    "direct-tcpip",
-                    (ip, 22),
-                    (jump_host, 0)
-                )
+                if ssh_ready:
+                    jump_client.close()
+                    return True
 
-                target_client = paramiko.SSHClient()
-                target_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            except Exception as exc:
+                logger.debug(f"SSH wait retry for {ip}: {exc}")
 
-                key = paramiko.RSAKey.from_private_key_file(private_key_path)
+            finally:
+                if jump_client:
+                    jump_client.close()
 
-                target_client.connect(
-                    hostname=ip,
-                    username="ubuntu",
-                    pkey=key,
-                    sock=jump_channel,
-                    timeout=5
-                )
-
-                target_client.close()
-                jump_client.close()
-
-                logger.info(f"SSH ready on {ip}")
-
-                return True
-
-            except Exception:
-                time.sleep(5)
+            time.sleep(5)
 
         logger.error(f"SSH timeout on {ip}")
-
         return False
 
     def provision_all(self, inventory, ports):
@@ -346,14 +446,11 @@ class Provisioner:
             port = ports[name]
             target_ip = port.fixed_ips[0]["ip_address"]
 
-            ssh_ready = self.wait_for_ssh(
-                target_ip,
-                private_key_path
-            )
-
+            ssh_ready = self.wait_for_ssh(target_ip, private_key_path)
             if not ssh_ready:
-                raise Exception(
-                    f"Cannot reach {name} via SSH at {target_ip}"
+                logger.warning(
+                    f"Cannot reach {name} via SSH at {target_ip}, "
+                    f"continuing anyway for diagnostics"
                 )
 
         logger.info(

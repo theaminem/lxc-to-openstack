@@ -1,9 +1,67 @@
 import logging
 import subprocess
+import shlex
 import paramiko
 
 
 logger = logging.getLogger("migration")
+
+
+class _CommandChannel:
+    def __init__(self, exit_code):
+        self._exit_code = exit_code
+
+    def recv_exit_status(self):
+        return self._exit_code
+
+
+class _CommandStream:
+    def __init__(self, data, exit_code):
+        self._data = data or b""
+        self.channel = _CommandChannel(exit_code)
+
+    def read(self):
+        return self._data
+
+
+class TenantSSHClient:
+    def __init__(self, jump_client, namespace, ip, remote_key_path, sudo_password):
+        self.jump_client = jump_client
+        self.namespace = namespace
+        self.ip = ip
+        self.remote_key_path = remote_key_path
+        self.sudo_password = sudo_password
+
+    def _escape_single_quotes(self, value):
+        return value.replace("'", "'\"'\"'")
+
+    def exec_command(self, command):
+        escaped_password = self._escape_single_quotes(self.sudo_password)
+        quoted_command = shlex.quote(command)
+
+        wrapped_command = (
+            f"echo '{escaped_password}' | sudo -S -p '' "
+            f"ip netns exec {self.namespace} "
+            f"ssh -o StrictHostKeyChecking=no "
+            f"-o UserKnownHostsFile=/dev/null "
+            f"-o ConnectTimeout=10 "
+            f"-i {self.remote_key_path} "
+            f"ubuntu@{self.ip} {quoted_command}"
+        )
+
+        stdin, stdout, stderr = self.jump_client.exec_command(wrapped_command)
+        exit_code = stdout.channel.recv_exit_status()
+        output = stdout.read()
+        errors = stderr.read()
+
+        return (
+            None,
+            _CommandStream(output, exit_code),
+            _CommandStream(errors, exit_code)
+        )
+
+    def close(self):
+        self.jump_client.close()
 
 
 class Restorer:
@@ -11,10 +69,94 @@ class Restorer:
     def __init__(self, config):
         self.config = config
 
-    def _get_ssh_client(self, ip, private_key_path):
+    def _get_jump_info(self):
         jump_host = self.config["openstack"]["auth_url"].split("//")[1].split(":")[0]
         jump_user = self.config["jump"]["username"]
         jump_password = self.config["jump"]["password"]
+        return jump_host, jump_user, jump_password
+
+    def _is_tenant_ip(self, ip):
+        source_subnet = self.config.get("source", {}).get("bridge_subnet", "")
+        if source_subnet.startswith("10.0.3."):
+            return ip.startswith("10.0.3.")
+        return ip.startswith("10.0.3.")
+
+    def _escape_single_quotes(self, value):
+        return value.replace("'", "'\"'\"'")
+
+    def _connect_jump_host(self):
+        jump_host, jump_user, jump_password = self._get_jump_info()
+
+        jump_client = paramiko.SSHClient()
+        jump_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        jump_client.connect(
+            hostname=jump_host,
+            username=jump_user,
+            password=jump_password,
+            timeout=10
+        )
+        return jump_client
+
+    def _run_jump_command(self, jump_client, command):
+        stdin, stdout, stderr = jump_client.exec_command(command)
+        exit_code = stdout.channel.recv_exit_status()
+        output = stdout.read().decode().strip()
+        errors = stderr.read().decode().strip()
+        return exit_code, output, errors
+
+    def _copy_key_to_jump_host(self, jump_client, private_key_path):
+        remote_key_path = "/tmp/migration-key"
+
+        sftp = jump_client.open_sftp()
+        sftp.put(private_key_path, remote_key_path)
+        sftp.close()
+
+        jump_password = self.config["jump"]["password"]
+        escaped_password = self._escape_single_quotes(jump_password)
+
+        command = f"echo '{escaped_password}' | sudo -S -p '' chmod 600 {remote_key_path}"
+        exit_code, output, errors = self._run_jump_command(jump_client, command)
+
+        if exit_code != 0:
+            raise Exception(f"Failed to chmod migration key on vm-cible: {errors}")
+
+        return remote_key_path
+
+    def _get_router_namespace(self, jump_client):
+        jump_password = self.config["jump"]["password"]
+        escaped_password = self._escape_single_quotes(jump_password)
+        command = (
+            f"echo '{escaped_password}' | sudo -S -p '' "
+            "ip netns | awk '/qrouter/ {print $1; exit}'"
+        )
+        exit_code, namespace, errors = self._run_jump_command(
+            jump_client,
+            command
+        )
+
+        if exit_code != 0 or not namespace:
+            raise Exception("No qrouter namespace found on vm-cible")
+
+        return namespace
+
+    def _get_ssh_client(self, ip, private_key_path):
+        jump_host, jump_user, jump_password = self._get_jump_info()
+
+        if self._is_tenant_ip(ip):
+            jump_client = self._connect_jump_host()
+            remote_key_path = self._copy_key_to_jump_host(
+                jump_client,
+                private_key_path
+            )
+            namespace = self._get_router_namespace(jump_client)
+            tenant_client = TenantSSHClient(
+                jump_client,
+                namespace,
+                ip,
+                remote_key_path,
+                jump_password
+            )
+            return tenant_client, None
 
         jump_client = paramiko.SSHClient()
         jump_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -559,7 +701,7 @@ class Restorer:
 
         logger.info("IP mappings updated")
 
-    def restore_all(self, inventory, backup_paths, private_key_path, ports):
+    def restore_all(self, inventory, backup_paths, private_key_path, ports, network_mode="provider"):
         ip_map = {}
         service_host_map = {}
 
@@ -611,6 +753,7 @@ class Restorer:
             f"NAT routing enabled for instances "
             f"via {provider_interface}"
         )
+
         jump_host = self.config["openstack"]["auth_url"].split("//")[1].split(":")[0]
         jump_user = self.config["jump"]["username"]
         jump_password = self.config["jump"]["password"]
@@ -625,13 +768,21 @@ class Restorer:
             password=jump_password,
             timeout=10
         )
-        stdin, stdout, stderr = proxy_client.exec_command(
-            "sudo DEBIAN_FRONTEND=noninteractive "
-            "apt-get install -y apt-cacher-ng && "
-            "sudo systemctl start apt-cacher-ng"
+        escaped_password = self._escape_single_quotes(jump_password)
+        proxy_command = (
+            f"echo '{escaped_password}' | sudo -S -p '' "
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y apt-cacher-ng && "
+            f"echo '{escaped_password}' | sudo -S -p '' systemctl enable apt-cacher-ng && "
+            f"echo '{escaped_password}' | sudo -S -p '' systemctl start apt-cacher-ng"
         )
-        stdout.channel.recv_exit_status()
+        stdin, stdout, stderr = proxy_client.exec_command(proxy_command)
+        exit_code = stdout.channel.recv_exit_status()
+        errors = stderr.read().decode().strip()
         proxy_client.close()
+
+        if exit_code != 0:
+            raise Exception(f"Failed to prepare apt-cacher-ng: {errors}")
+
         logger.info("APT proxy (apt-cacher-ng) ready on vm-cible")
 
         for container in inventory:
@@ -670,8 +821,8 @@ class Restorer:
 
                 self.restore_ftp(ip, private_key_path, server_type)
 
-        if ip_map or service_host_map:
-            logger.info("Updating IP configurations...")
+        if network_mode == "provider" and ip_map:
+            logger.info("Provider mode: updating IP configurations...")
 
             for container in inventory:
                 name = container["name"]
@@ -688,5 +839,31 @@ class Restorer:
                     ip_map,
                     service_host_map
                 )
+
+        elif network_mode == "tenant":
+            logger.info(
+                "Tenant mode: source IPs preserved, no IP remapping needed"
+            )
+
+            for container in inventory:
+                name = container["name"]
+
+                if name not in ports:
+                    continue
+
+                port = ports[name]
+                ip = port.fixed_ips[0]["ip_address"]
+
+                self.update_ip_mappings(
+                    ip,
+                    private_key_path,
+                    {},
+                    service_host_map
+                )
+
+        else:
+            logger.warning(
+                f"Unknown network mode '{network_mode}', skipping IP remapping"
+            )
 
         logger.info("All restorations complete")
