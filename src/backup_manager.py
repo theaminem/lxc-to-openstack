@@ -18,20 +18,33 @@ class BackupManager:
         logger.info(f"Backing up MariaDB from {name}...")
 
         dump_path = os.path.join(self.backup_dir, "mariadb_dump.sql")
+        databases = run_command(
+            f"sudo lxc-attach -n {name} -- "
+            f"mysql -u root -N -e 'SHOW DATABASES'"
+        )
+        db_list = [
+            db.strip() for db in databases.split("\n")
+            if db.strip() and db.strip() not in
+            ["information_schema", "mysql", "performance_schema", "sys"]
+        ]
+        db_names = " ".join(db_list)
+        logger.info(f"Dumping databases: {db_names}")
+
         run_command(
             f"sudo lxc-attach -n {name} -- "
-            f"mysqldump -u root --all-databases "
-            f"--routines --triggers --events > {dump_path}"
+            f"mysqldump -u root --single-transaction "
+            f"--routines --triggers --events "
+            f"--databases {db_names} > {dump_path}"
         )
-
         users_path = os.path.join(self.backup_dir, "mariadb_users.sql")
         run_command(
             f"sudo lxc-attach -n {name} -- "
-            f"mysql -u root -e "
-            f"\"SELECT User,Host,Password FROM mysql.user\" "
-            f"> {users_path}"
+            f"bash -c 'mysqldump -u root --single-transaction "
+            f"--routines --triggers --events "
+            f"--databases $(mysql -u root -N -e \"SHOW DATABASES\" "
+            f"| grep -vE \"information_schema|mysql|performance_schema|sys\") "
+            f"' > {dump_path}"
         )
-
         self._verify_file(dump_path, "MariaDB dump")
         logger.info(
             f"MariaDB backup complete: {self._file_size(dump_path)}"

@@ -22,7 +22,7 @@ network:
   use_provider: true
 
 compute:
-  image_name: "ubuntu-cloud"
+  image_name: "ubuntu-22.04"
   flavor_name: "m1.migration"
   flavor_ram: 1024
   flavor_vcpus: 1

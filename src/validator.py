@@ -60,7 +60,7 @@ class Validator:
 
         exit_code, output = self._run_remote(
             client,
-            "sudo mysql -u appuser -ppass123 -e "
+         "mysql -u appuser -ppassword -h 127.0.0.1 -e "
             "\"SELECT COUNT(*) FROM app_db.users\""
         )
 
@@ -130,7 +130,7 @@ class Validator:
 
         exit_code_conn, conn_test = self._run_remote(
             client,
-            f"mysqldump -u appuser -ppass123 -h {mariadb_ip} "
+            f"mysqldump -u appuser -ppassword -h {mariadb_ip} "
             f"--no-data app_db 2>/dev/null | head -1"
         )
 
