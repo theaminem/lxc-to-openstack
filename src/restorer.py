@@ -1,869 +1,567 @@
+"""
+Restorer — installation et restauration des services sur les instances OpenStack.
+
+Améliorations v2 :
+- Utilise JumpHostClient (plus de duplication SSH)
+- Credentials MariaDB passés en paramètre (plus de hardcode 'password')
+- _is_tenant_ip() supprimé (géré par JumpHostClient)
+- bind-address sur l'IP de l'instance, pas 0.0.0.0
+- Chemin config MariaDB détecté dynamiquement via le scanner
+- Provider interface et CIDR lus depuis config (plus de 'ens35' hardcodé)
+- Proxy APT optionnel (use_proxy: false = accès Internet direct)
+- DROP USER dynamique basé sur le subnet source réel
+"""
+
 import logging
 import subprocess
-import shlex
+
 import paramiko
 
+from src.jump_client import JumpHostClient
 
 logger = logging.getLogger("migration")
 
 
-class _CommandChannel:
-    def __init__(self, exit_code):
-        self._exit_code = exit_code
-
-    def recv_exit_status(self):
-        return self._exit_code
-
-
-class _CommandStream:
-    def __init__(self, data, exit_code):
-        self._data = data or b""
-        self.channel = _CommandChannel(exit_code)
-
-    def read(self):
-        return self._data
-
-
-class TenantSSHClient:
-    def __init__(self, jump_client, namespace, ip, remote_key_path, sudo_password):
-        self.jump_client = jump_client
-        self.namespace = namespace
-        self.ip = ip
-        self.remote_key_path = remote_key_path
-        self.sudo_password = sudo_password
-
-    def _escape_single_quotes(self, value):
-        return value.replace("'", "'\"'\"'")
-
-    def exec_command(self, command):
-        escaped_password = self._escape_single_quotes(self.sudo_password)
-        quoted_command = shlex.quote(command)
-
-        wrapped_command = (
-            f"echo '{escaped_password}' | sudo -S -p '' "
-            f"ip netns exec {self.namespace} "
-            f"ssh -o StrictHostKeyChecking=no "
-            f"-o UserKnownHostsFile=/dev/null "
-            f"-o ConnectTimeout=10 "
-            f"-i {self.remote_key_path} "
-            f"ubuntu@{self.ip} {quoted_command}"
-        )
-
-        stdin, stdout, stderr = self.jump_client.exec_command(wrapped_command)
-        exit_code = stdout.channel.recv_exit_status()
-        output = stdout.read()
-        errors = stderr.read()
-
-        return (
-            None,
-            _CommandStream(output, exit_code),
-            _CommandStream(errors, exit_code)
-        )
-
-    def close(self):
-        self.jump_client.close()
-
-
 class Restorer:
 
-    def __init__(self, config):
+    def __init__(self, config: dict):
         self.config = config
 
-    def _get_jump_info(self):
+    # -----------------------------------------------------------------------
+    # APT proxy
+    # -----------------------------------------------------------------------
+
+    def _ensure_apt_proxy_on_jump(self):
+        """Install and start apt-cacher-ng on the jump host (called once)."""
+        apt_cfg = self.config.get("apt", {})
+        if not apt_cfg.get("use_proxy", True):
+            return
+
         jump_host = self.config["openstack"]["auth_url"].split("//")[1].split(":")[0]
         jump_user = self.config["jump"]["username"]
         jump_password = self.config["jump"]["password"]
-        return jump_host, jump_user, jump_password
 
-    def _is_tenant_ip(self, ip):
-        source_subnet = self.config.get("source", {}).get("bridge_subnet", "")
-        if source_subnet.startswith("10.0.3."):
-            return ip.startswith("10.0.3.")
-        return ip.startswith("10.0.3.")
-
-    def _escape_single_quotes(self, value):
-        return value.replace("'", "'\"'\"'")
-
-    def _connect_jump_host(self):
-        jump_host, jump_user, jump_password = self._get_jump_info()
-
-        jump_client = paramiko.SSHClient()
-        jump_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        jump_client.connect(
-            hostname=jump_host,
-            username=jump_user,
-            password=jump_password,
-            timeout=10
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            hostname=jump_host, username=jump_user,
+            password=jump_password, timeout=10
         )
-        return jump_client
-
-    def _run_jump_command(self, jump_client, command):
-        stdin, stdout, stderr = jump_client.exec_command(command)
-        exit_code = stdout.channel.recv_exit_status()
-        output = stdout.read().decode().strip()
-        errors = stderr.read().decode().strip()
-        return exit_code, output, errors
-
-    def _copy_key_to_jump_host(self, jump_client, private_key_path):
-        remote_key_path = "/tmp/migration-key"
-
-        sftp = jump_client.open_sftp()
-        sftp.put(private_key_path, remote_key_path)
-        sftp.close()
-
-        jump_password = self.config["jump"]["password"]
-        escaped_password = self._escape_single_quotes(jump_password)
-
-        command = f"echo '{escaped_password}' | sudo -S -p '' chmod 600 {remote_key_path}"
-        exit_code, output, errors = self._run_jump_command(jump_client, command)
-
-        if exit_code != 0:
-            raise Exception(f"Failed to chmod migration key on vm-cible: {errors}")
-
-        return remote_key_path
-
-    def _get_router_namespace(self, jump_client):
-        jump_password = self.config["jump"]["password"]
-        escaped_password = self._escape_single_quotes(jump_password)
-        command = (
-            f"echo '{escaped_password}' | sudo -S -p '' "
-            "ip netns | awk '/qrouter/ {print $1; exit}'"
+        _, stdout, stderr = client.exec_command(
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y apt-cacher-ng "
+            "&& systemctl enable apt-cacher-ng "
+            "&& systemctl start apt-cacher-ng"
         )
-        exit_code, namespace, errors = self._run_jump_command(
-            jump_client,
-            command
-        )
-
-        if exit_code != 0 or not namespace:
-            raise Exception("No qrouter namespace found on vm-cible")
-
-        return namespace
-
-    def _get_ssh_client(self, ip, private_key_path):
-        jump_host, jump_user, jump_password = self._get_jump_info()
-
-        if self._is_tenant_ip(ip):
-            jump_client = self._connect_jump_host()
-            remote_key_path = self._copy_key_to_jump_host(
-                jump_client,
-                private_key_path
+        rc = stdout.channel.recv_exit_status()
+        client.close()
+        if rc != 0:
+            raise Exception(
+                f"apt-cacher-ng setup failed: {stderr.read().decode().strip()}"
             )
-            namespace = self._get_router_namespace(jump_client)
-            tenant_client = TenantSSHClient(
-                jump_client,
-                namespace,
-                ip,
-                remote_key_path,
-                jump_password
-            )
-            return tenant_client, None
-
-        jump_client = paramiko.SSHClient()
-        jump_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        jump_client.connect(
-            hostname=jump_host,
-            username=jump_user,
-            password=jump_password,
-            timeout=10
+        logger.info(
+            f"APT proxy ready on {jump_host}:{apt_cfg.get('proxy_port', 3142)}"
         )
 
-        jump_transport = jump_client.get_transport()
-        jump_channel = jump_transport.open_channel(
-            "direct-tcpip",
-            (ip, 22),
-            (jump_host, 0)
-        )
-
-        target_client = paramiko.SSHClient()
-        target_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        key = paramiko.RSAKey.from_private_key_file(private_key_path)
-
-        target_client.connect(
-            hostname=ip,
-            username="ubuntu",
-            pkey=key,
-            sock=jump_channel,
-            timeout=10
-        )
-
-        return target_client, jump_client
-
-    def _run_remote(self, client, command, description=""):
-        if description:
-            logger.info(f"  -> {description}")
-
-        logger.debug(f"  CMD: {command}")
-
-        stdin, stdout, stderr = client.exec_command(command)
-        exit_code = stdout.channel.recv_exit_status()
-
-        output = stdout.read().decode().strip()
-        errors = stderr.read().decode().strip()
-
-        if exit_code != 0:
-            logger.error(f"  Command failed (exit {exit_code}): {command}")
-            if errors:
-                logger.error(f"  STDERR: {errors}")
-            raise Exception(f"Remote command failed: {command}")
-
-        if output:
-            logger.debug(f"  OUTPUT: {output[:300]}")
-
-        return output
-
-    def _run_remote_soft(self, client, command, description=""):
-        try:
-            return self._run_remote(client, command, description)
-        except Exception as exc:
-            logger.warning(f"  Soft command failed: {description or command}")
-            logger.debug(str(exc))
-            return ""
-
-    def _fix_apt_sources(self, client):
+    def _configure_apt_proxy_on_instance(self, jc: JumpHostClient, client):
+        apt_cfg = self.config.get("apt", {})
+        if not apt_cfg.get("use_proxy", True):
+            logger.info("  APT proxy disabled — direct Internet access")
+            return
         jump_host = self.config["openstack"]["auth_url"].split("//")[1].split(":")[0]
-
-        codename = self._run_remote(
+        proxy_port = apt_cfg.get("proxy_port", 3142)
+        jc.run(
             client,
-            "lsb_release -cs",
-            "Detecting Ubuntu release"
-        ).strip()
+            f"echo 'Acquire::http::Proxy \"http://{jump_host}:{proxy_port}\";' "
+            f"| sudo tee /etc/apt/apt.conf.d/00proxy > /dev/null",
+            f"Setting APT proxy to {jump_host}:{proxy_port}"
+        )
+
+    def _fix_apt_sources(self, jc: JumpHostClient, client,
+                          codename: str = ""):
         if not codename:
-            codename = "jammy"
-
-        self._run_remote_soft(
+            codename = jc.run(
+                client, "lsb_release -cs", "Detecting OS release"
+            ).strip() or "jammy"
+        jc.run_soft(
             client,
-            "sudo rm -f /etc/apt/apt.conf.d/00proxy "
-            "/etc/apt/apt.conf.d/99proxy "
-            "/etc/apt/apt.conf.d/01proxy || true",
-            "Removing old proxy config"
+            "sudo rm -f /etc/apt/sources.list.d/ubuntu.sources",
+            "Removing cloud APT sources"
         )
-        self._run_remote_soft(
-            client,
-            "sudo rm -f /etc/apt/sources.list.d/ubuntu.sources || true",
-            "Removing cloud apt sources"
-        )
-        self._run_remote(
-            client,
-            f"echo 'Acquire::http::Proxy \"http://{jump_host}:3142\";' | "
-            f"sudo tee /etc/apt/apt.conf.d/00proxy > /dev/null",
-            f"Setting APT proxy to {jump_host}"
-        )
-        self._run_remote(
+        jc.run(
             client,
             f"printf '%s\\n' "
             f"'deb http://archive.ubuntu.com/ubuntu {codename} main restricted universe multiverse' "
             f"'deb http://archive.ubuntu.com/ubuntu {codename}-updates main restricted universe multiverse' "
             f"'deb http://security.ubuntu.com/ubuntu {codename}-security main restricted universe multiverse' "
             f"| sudo tee /etc/apt/sources.list > /dev/null",
-            f"Writing apt sources ({codename}) via proxy"
+            f"Writing APT sources ({codename})"
         )
-        self._run_remote(
-            client,
-            "sudo apt-get clean",
-            "Cleaning apt cache"
-        )
-        self._run_remote(
+        jc.run(client, "sudo apt-get clean", "Cleaning APT cache")
+        jc.run(
             client,
             "sudo DEBIAN_FRONTEND=noninteractive apt-get update",
-            "Updating apt index"
+            "Updating APT index"
         )
 
-    def _inject_hosts_mapping(self, client, host_map):
+    # -----------------------------------------------------------------------
+    # IP / hosts mapping
+    # -----------------------------------------------------------------------
+
+    def _inject_hosts_mapping(self, jc: JumpHostClient, client,
+                               host_map: dict):
         if not host_map:
             return
-
-        self._run_remote_soft(
+        jc.run_soft(
             client,
-            "sudo cp /etc/hosts /etc/hosts.backup.$(date +%s) || true",
+            "sudo cp /etc/hosts /etc/hosts.backup.$(date +%s)",
             "Backing up /etc/hosts"
         )
-
         for name, ip in host_map.items():
-            self._run_remote_soft(
+            jc.run_soft(
                 client,
-                f"sudo sed -i '/ {name}\\.internal$/d' /etc/hosts || true"
+                f"sudo sed -i '/ {name}\\.internal$/d' /etc/hosts"
             )
-            self._run_remote(
+            jc.run(
                 client,
-                f"echo '{ip} {name}.internal' | sudo tee -a /etc/hosts > /dev/null",
-                f"Adding host mapping {name}.internal -> {ip}"
+                f"echo '{ip} {name}.internal' "
+                f"| sudo tee -a /etc/hosts > /dev/null",
+                f"Adding {name}.internal -> {ip}"
             )
 
-    def _replace_ip_in_configs(self, client, old_ip, new_value):
+    def _replace_ip_in_configs(self, jc: JumpHostClient, client,
+                                old_ip: str, new_value: str):
         safe_paths = "/etc /var/www /root"
-
-        self._run_remote_soft(
+        jc.run_soft(
             client,
             f"sudo grep -rl '{old_ip}' {safe_paths} 2>/dev/null | "
             f"while read f; do "
             f"sudo sed -i 's/{old_ip}/{new_value}/g' \"$f\"; "
             f"done",
-            f"Replacing {old_ip} -> {new_value}"
+            f"Replacing {old_ip} -> {new_value} in configs"
         )
 
-    def restore_mariadb(self, ip, private_key_path):
+    # -----------------------------------------------------------------------
+    # MariaDB
+    # -----------------------------------------------------------------------
+
+    def restore_mariadb(self, ip: str, private_key_path: str,
+                        container: dict, db_password: str):
         logger.info(f"Restoring MariaDB on {ip}...")
+        os_info = container.get("os", {})
+        codename = os_info.get("codename", "jammy")
+        mariadb_cnf = os_info.get(
+            "mariadb_cnf_path",
+            "/etc/mysql/mariadb.conf.d/50-server.cnf"
+        )
+        app_users = container.get("app_users", [])
 
-        client, jump = self._get_ssh_client(ip, private_key_path)
+        with JumpHostClient(self.config) as jc:
+            client = jc.connect(ip, private_key_path)
+            self._configure_apt_proxy_on_instance(jc, client)
+            self._fix_apt_sources(jc, client, codename)
 
-        try:
-            self._fix_apt_sources(client)
-
-            self._run_remote(
+            jc.run(
                 client,
                 "sudo DEBIAN_FRONTEND=noninteractive "
                 "apt-get install -y mariadb-server",
                 "Installing mariadb-server"
             )
 
-            stdin_vdb, stdout_vdb, stderr_vdb = client.exec_command(
-                "ls /dev/vdb 2>/dev/null"
-            )
-            vdb_exists = stdout_vdb.channel.recv_exit_status() == 0
-
-            if vdb_exists:
+            # Cinder volume setup
+            vdb_check = jc.run_soft(client, "ls /dev/vdb 2>/dev/null")
+            if vdb_check:
                 logger.info("  Cinder volume detected, configuring...")
-
-                self._run_remote_soft(
+                jc.run_soft(client, "sudo systemctl stop mariadb",
+                            "Stopping MariaDB")
+                jc.run(client, "sudo mkfs.ext4 -F /dev/vdb",
+                       "Formatting Cinder volume")
+                jc.run(client, "sudo mkdir -p /mnt/mariadb-data",
+                       "Creating mount point")
+                jc.run(client, "sudo mount /dev/vdb /mnt/mariadb-data",
+                       "Mounting temporarily")
+                jc.run(client,
+                       "sudo cp -a /var/lib/mysql/. /mnt/mariadb-data/",
+                       "Copying data to volume")
+                jc.run(client, "sudo umount /mnt/mariadb-data")
+                jc.run(client, "sudo mount /dev/vdb /var/lib/mysql",
+                       "Mounting to /var/lib/mysql")
+                jc.run(client, "sudo chown -R mysql:mysql /var/lib/mysql",
+                       "Fixing permissions")
+                jc.run_soft(
                     client,
-                    "sudo systemctl stop mariadb",
-                    "Stopping MariaDB to setup volume"
+                    "sudo sed -i '\\|/dev/vdb /var/lib/mysql|d' /etc/fstab"
                 )
-
-                self._run_remote(
-                    client,
-                    "sudo mkfs.ext4 -F /dev/vdb",
-                    "Formatting Cinder volume"
-                )
-
-                self._run_remote(
-                    client,
-                    "sudo mkdir -p /mnt/mariadb-data",
-                    "Creating mount point"
-                )
-
-                self._run_remote(
-                    client,
-                    "sudo mount /dev/vdb /mnt/mariadb-data",
-                    "Mounting Cinder volume"
-                )
-
-                self._run_remote(
-                    client,
-                    "sudo cp -a /var/lib/mysql/. /mnt/mariadb-data/",
-                    "Copying MariaDB data to volume"
-                )
-
-                self._run_remote(
-                    client,
-                    "sudo umount /mnt/mariadb-data",
-                    "Unmounting temporary mount"
-                )
-
-                self._run_remote(
-                    client,
-                    "sudo mount /dev/vdb /var/lib/mysql",
-                    "Mounting volume to /var/lib/mysql"
-                )
-
-                self._run_remote(
-                    client,
-                    "sudo chown -R mysql:mysql /var/lib/mysql",
-                    "Fixing permissions"
-                )
-
-                self._run_remote_soft(
-                    client,
-                    "sudo sed -i '\\|/dev/vdb /var/lib/mysql|d' /etc/fstab || true"
-                )
-
-                self._run_remote(
+                jc.run(
                     client,
                     "echo '/dev/vdb /var/lib/mysql ext4 defaults 0 2' "
                     "| sudo tee -a /etc/fstab > /dev/null",
-                    "Adding volume to fstab for auto-mount"
+                    "Persisting mount in fstab"
                 )
-
             else:
-                logger.warning("  No Cinder volume found, using instance disk")
+                logger.warning("  No Cinder volume — using instance disk")
 
-            self._run_remote_soft(
-                client,
-                "sudo systemctl start mariadb",
-                "Starting MariaDB"
-            )
-
-            self._run_remote(
+            jc.run_soft(client, "sudo systemctl start mariadb",
+                        "Starting MariaDB")
+            jc.run(
                 client,
                 "sudo mysql -u root < /tmp/mariadb_dump.sql",
                 "Importing database dump"
             )
 
-            self._run_remote(
-                client,
-                "sudo mysql -u root -e \""
-                "CREATE USER IF NOT EXISTS 'appuser'@'%' "
-                "IDENTIFIED BY 'password'; "
-                "GRANT ALL PRIVILEGES ON *.* TO 'appuser'@'%'; "
-                "DROP USER IF EXISTS 'appuser'@'10.0.3.20'; "
-                "DROP USER IF EXISTS 'appuser'@'10.0.3.30'; "
-                "FLUSH PRIVILEGES;\"",
-                "Fixing user grants for new network"
+            # Recreate app users with runtime password (no hardcode)
+            bridge_subnet = self.config.get("source", {}).get(
+                "bridge_subnet", ""
             )
-
-            self._run_remote(
-                client,
-                "sudo sed -i 's/^bind-address.*/bind-address = 0.0.0.0/' "
-                "/etc/mysql/mariadb.conf.d/50-server.cnf",
-                "Setting bind-address to 0.0.0.0"
+            subnet_prefix = (
+                ".".join(bridge_subnet.split(".")[:3])
+                if bridge_subnet else ""
             )
+            if app_users:
+                for u in app_users:
+                    user = u["user"]
+                    jc.run(
+                        client,
+                        f"sudo mysql -u root -e \""
+                        f"CREATE USER IF NOT EXISTS '{user}'@'%' "
+                        f"IDENTIFIED BY '{db_password}'; "
+                        f"GRANT ALL PRIVILEGES ON *.* TO '{user}'@'%'; "
+                        f"FLUSH PRIVILEGES;\"",
+                        f"Recreating user '{user}'"
+                    )
+                    if subnet_prefix:
+                        jc.run_soft(
+                            client,
+                            f"sudo mysql -u root -e \""
+                            f"DELETE FROM mysql.user "
+                            f"WHERE User='{user}' "
+                            f"AND Host LIKE '{subnet_prefix}.%'; "
+                            f"FLUSH PRIVILEGES;\""
+                        )
+            else:
+                logger.warning("  No app users in inventory — skipping")
 
-            self._run_remote(
+            # Bind to instance IP only (not 0.0.0.0)
+            jc.run(
                 client,
-                "sudo systemctl restart mariadb",
-                "Restarting MariaDB"
+                f"sudo sed -i 's/^bind-address.*/bind-address = {ip}/' "
+                f"{mariadb_cnf}",
+                f"Setting bind-address to {ip}"
             )
-
-        finally:
-            client.close()
-            if jump:
-                jump.close()
+            jc.run_soft(client, "sudo systemctl restart mariadb",
+                        "Restarting MariaDB")
 
         logger.info("MariaDB restoration complete")
 
-    def restore_apache(self, ip, private_key_path):
+    # -----------------------------------------------------------------------
+    # Apache
+    # -----------------------------------------------------------------------
+
+    def restore_apache(self, ip: str, private_key_path: str,
+                       container: dict):
         logger.info(f"Restoring Apache on {ip}...")
+        codename = container.get("os", {}).get("codename", "jammy")
 
-        client, jump = self._get_ssh_client(ip, private_key_path)
+        with JumpHostClient(self.config) as jc:
+            client = jc.connect(ip, private_key_path)
+            self._configure_apt_proxy_on_instance(jc, client)
+            self._fix_apt_sources(jc, client, codename)
 
-        try:
-            self._fix_apt_sources(client)
-
-            self._run_remote(
+            jc.run(
                 client,
                 "sudo DEBIAN_FRONTEND=noninteractive "
                 "apt-get install -y apache2 php php-mysql libapache2-mod-php",
-                "Installing Apache and PHP"
+                "Installing Apache + PHP"
             )
-
-            self._run_remote(
+            jc.run(
                 client,
                 "sudo tar xzf /tmp/apache_backup.tar.gz -C /",
                 "Extracting Apache backup"
             )
-
-            self._run_remote_soft(
-                client,
-                "sudo rm -f /var/www/html/index.html",
-                "Removing default Apache page"
-            )
-
-            self._run_remote_soft(
+            jc.run_soft(client, "sudo rm -f /var/www/html/index.html",
+                        "Removing default page")
+            jc.run_soft(
                 client,
                 "sudo a2enmod ssl rewrite headers 2>/dev/null || true",
                 "Enabling common modules"
             )
-
-            modules_output = self._run_remote_soft(
-                client,
-                "cat /tmp/apache_modules.txt",
-                "Reading module list"
+            modules_output = jc.run_soft(
+                client, "cat /tmp/apache_modules.txt"
             )
-
             for line in modules_output.split("\n"):
                 line = line.strip()
                 if "_module" in line and "(" in line:
-                    module_name = line.split("_module")[0].strip()
-                    self._run_remote_soft(
+                    mod = line.split("_module")[0].strip()
+                    jc.run_soft(
                         client,
-                        f"sudo a2enmod {module_name} 2>/dev/null || true"
+                        f"sudo a2enmod {mod} 2>/dev/null || true"
                     )
-
-            self._run_remote_soft(
+            jc.run_soft(
                 client,
                 "sudo a2ensite *.conf 2>/dev/null || true",
                 "Enabling virtual hosts"
             )
-
-            self._run_remote(
-                client,
-                "sudo systemctl restart apache2",
-                "Restarting Apache"
-            )
-
-        finally:
-            client.close()
-            if jump:
-                jump.close()
+            jc.run(client, "sudo systemctl restart apache2",
+                   "Restarting Apache")
 
         logger.info("Apache restoration complete")
 
-    def restore_backup(self, ip, private_key_path):
+    # -----------------------------------------------------------------------
+    # Backup service
+    # -----------------------------------------------------------------------
+
+    def restore_backup(self, ip: str, private_key_path: str,
+                       container: dict):
         logger.info(f"Restoring Backup service on {ip}...")
+        codename = container.get("os", {}).get("codename", "jammy")
 
-        client, jump = self._get_ssh_client(ip, private_key_path)
+        with JumpHostClient(self.config) as jc:
+            client = jc.connect(ip, private_key_path)
+            self._configure_apt_proxy_on_instance(jc, client)
+            self._fix_apt_sources(jc, client, codename)
 
-        try:
-            self._fix_apt_sources(client)
-
-            self._run_remote(
+            jc.run(
                 client,
                 "sudo DEBIAN_FRONTEND=noninteractive "
                 "apt-get install -y mariadb-client",
                 "Installing mariadb-client"
             )
-
-            self._run_remote_soft(
+            jc.run_soft(
                 client,
-                "sudo cp /tmp/backup_script.sh /root/backup.sh && "
-                "sudo chmod +x /root/backup.sh",
+                "sudo cp /tmp/backup_script.sh /root/backup.sh "
+                "&& sudo chmod +x /root/backup.sh",
                 "Installing backup script"
             )
-
-            self._run_remote_soft(
-                client,
-                "sudo crontab /tmp/backup_crontab.txt",
+            jc.run_soft(
+                client, "sudo crontab /tmp/backup_crontab.txt",
                 "Installing crontab"
             )
 
-        finally:
-            client.close()
-            if jump:
-                jump.close()
-
         logger.info("Backup service restoration complete")
 
-    def restore_nfs(self, ip, private_key_path, shared_dirs):
+    # -----------------------------------------------------------------------
+    # NFS
+    # -----------------------------------------------------------------------
+
+    def restore_nfs(self, ip: str, private_key_path: str,
+                    container: dict, shared_dirs: list):
         logger.info(f"Restoring NFS on {ip}...")
+        codename = container.get("os", {}).get("codename", "jammy")
 
-        client, jump = self._get_ssh_client(ip, private_key_path)
+        with JumpHostClient(self.config) as jc:
+            client = jc.connect(ip, private_key_path)
+            self._configure_apt_proxy_on_instance(jc, client)
+            self._fix_apt_sources(jc, client, codename)
 
-        try:
-            self._fix_apt_sources(client)
-
-            self._run_remote(
+            jc.run(
                 client,
                 "sudo DEBIAN_FRONTEND=noninteractive "
                 "apt-get install -y nfs-kernel-server",
                 "Installing NFS server"
             )
-
-            self._run_remote(
-                client,
-                "sudo cp /tmp/nfs_exports.txt /etc/exports",
-                "Restoring /etc/exports"
-            )
-
-            for directory in shared_dirs:
-                self._run_remote(
-                    client,
-                    f"sudo mkdir -p {directory}",
-                    f"Creating shared directory {directory}"
-                )
-
-            self._run_remote_soft(
-                client,
-                "sudo tar xzf /tmp/nfs_data.tar.gz -C /",
+            jc.run(client, "sudo cp /tmp/nfs_exports.txt /etc/exports",
+                   "Restoring /etc/exports")
+            for d in shared_dirs:
+                jc.run(client, f"sudo mkdir -p {d}",
+                       f"Creating shared dir {d}")
+            jc.run_soft(
+                client, "sudo tar xzf /tmp/nfs_data.tar.gz -C /",
                 "Extracting NFS data"
             )
-
-            self._run_remote(
-                client,
-                "sudo exportfs -ra",
-                "Applying NFS exports"
-            )
-
-            self._run_remote(
-                client,
-                "sudo systemctl restart nfs-kernel-server",
-                "Restarting NFS server"
-            )
-
-        finally:
-            client.close()
-            if jump:
-                jump.close()
+            jc.run(client, "sudo exportfs -ra", "Applying NFS exports")
+            jc.run(client, "sudo systemctl restart nfs-kernel-server",
+                   "Restarting NFS")
 
         logger.info("NFS restoration complete")
 
-    def restore_ftp(self, ip, private_key_path, server_type):
+    # -----------------------------------------------------------------------
+    # FTP
+    # -----------------------------------------------------------------------
+
+    def restore_ftp(self, ip: str, private_key_path: str,
+                    container: dict, server_type: str):
         logger.info(f"Restoring FTP ({server_type}) on {ip}...")
+        codename = container.get("os", {}).get("codename", "jammy")
 
-        client, jump = self._get_ssh_client(ip, private_key_path)
+        with JumpHostClient(self.config) as jc:
+            client = jc.connect(ip, private_key_path)
+            self._configure_apt_proxy_on_instance(jc, client)
+            self._fix_apt_sources(jc, client, codename)
 
-        try:
-            self._fix_apt_sources(client)
-
-            self._run_remote(
+            jc.run(
                 client,
                 f"sudo DEBIAN_FRONTEND=noninteractive "
                 f"apt-get install -y {server_type}",
                 f"Installing {server_type}"
             )
+            config_dest = (
+                "/etc/vsftpd.conf"
+                if server_type == "vsftpd"
+                else "/etc/proftpd/proftpd.conf"
+            )
+            if server_type == "proftpd":
+                jc.run(client, "sudo mkdir -p /etc/proftpd")
 
-            if server_type == "vsftpd":
-                config_dest = "/etc/vsftpd.conf"
-            else:
-                config_dest = "/etc/proftpd/proftpd.conf"
-                self._run_remote(
-                    client,
-                    "sudo mkdir -p /etc/proftpd"
-                )
-
-            self._run_remote(
+            jc.run(
                 client,
                 f"sudo cp /tmp/ftp_config.conf {config_dest}",
-                f"Restoring FTP config to {config_dest}"
+                "Restoring FTP config"
             )
-
-            users_output = self._run_remote_soft(
-                client,
-                "cat /tmp/ftp_users.txt",
-                "Reading FTP users"
+            users_output = jc.run_soft(
+                client, "cat /tmp/ftp_users.txt", "Reading FTP users"
             )
-
             for line in users_output.split("\n"):
                 parts = line.split(":")
                 if len(parts) >= 3:
                     try:
                         uid = int(parts[2])
                         username = parts[0]
-                        if uid >= 1000 and username != "nobody":
-                            self._run_remote_soft(
+                        if uid >= 1000 and username not in ("nobody",):
+                            jc.run_soft(
                                 client,
                                 f"sudo useradd -m {username} 2>/dev/null || true"
                             )
                     except ValueError:
                         pass
 
-            self._run_remote_soft(
-                client,
-                "sudo tar xzf /tmp/ftp_data.tar.gz -C /",
+            jc.run_soft(
+                client, "sudo tar xzf /tmp/ftp_data.tar.gz -C /",
                 "Extracting FTP data"
             )
-
-            self._run_remote(
-                client,
-                f"sudo systemctl restart {server_type}",
-                f"Restarting {server_type}"
-            )
-
-        finally:
-            client.close()
-            if jump:
-                jump.close()
+            jc.run(client, f"sudo systemctl restart {server_type}",
+                   f"Restarting {server_type}")
 
         logger.info("FTP restoration complete")
 
-    def update_ip_mappings(self, ip, private_key_path, ip_map, service_host_map=None):
+    # -----------------------------------------------------------------------
+    # IP remapping
+    # -----------------------------------------------------------------------
+
+    def update_ip_mappings(self, ip: str, private_key_path: str,
+                           ip_map: dict, service_host_map: dict):
         logger.info(f"Updating IP mappings on {ip}...")
 
-        client, jump = self._get_ssh_client(ip, private_key_path)
+        with JumpHostClient(self.config) as jc:
+            client = jc.connect(ip, private_key_path)
 
-        try:
             if service_host_map:
-                self._inject_hosts_mapping(client, service_host_map)
+                self._inject_hosts_mapping(jc, client, service_host_map)
 
             for old_ip, new_ip in ip_map.items():
-                self._replace_ip_in_configs(client, old_ip, new_ip)
+                self._replace_ip_in_configs(jc, client, old_ip, new_ip)
 
-            self._run_remote_soft(
-                client,
-                "sudo systemctl restart apache2 2>/dev/null || true"
-            )
-
-            self._run_remote_soft(
-                client,
-                "sudo systemctl restart mariadb 2>/dev/null || true"
-            )
-
-            self._run_remote_soft(
-                client,
-                "sudo systemctl restart nfs-kernel-server 2>/dev/null || true"
-            )
-
-            self._run_remote_soft(
-                client,
-                "sudo systemctl restart vsftpd 2>/dev/null || true"
-            )
-
-            self._run_remote_soft(
-                client,
-                "sudo systemctl restart proftpd 2>/dev/null || true"
-            )
-
-        finally:
-            client.close()
-            if jump:
-                jump.close()
+            for svc in ("apache2", "mariadb", "nfs-kernel-server",
+                        "vsftpd", "proftpd"):
+                jc.run_soft(
+                    client,
+                    f"sudo systemctl restart {svc} 2>/dev/null || true"
+                )
 
         logger.info("IP mappings updated")
 
-    def restore_all(self, inventory, backup_paths, private_key_path, ports, network_mode="provider"):
-        ip_map = {}
-        service_host_map = {}
+    # -----------------------------------------------------------------------
+    # NAT on migration host
+    # -----------------------------------------------------------------------
 
+    def _setup_nat(self):
+        os_cfg = self.config.get("openstack", {})
+        interface = os_cfg.get("provider_interface", "ens35")
+        cidr = os_cfg.get("provider_cidr", "10.0.0.0/24")
+
+        subprocess.run(
+            ["sudo", "sysctl", "-w", "net.ipv4.ip_forward=1"],
+            capture_output=True
+        )
+        check = subprocess.run(
+            ["sudo", "iptables", "-t", "nat", "-C", "POSTROUTING",
+             "-s", cidr, "-o", interface, "-j", "MASQUERADE"],
+            capture_output=True
+        )
+        if check.returncode != 0:
+            subprocess.run(
+                ["sudo", "iptables", "-t", "nat", "-A", "POSTROUTING",
+                 "-s", cidr, "-o", interface, "-j", "MASQUERADE"],
+                capture_output=True
+            )
+        logger.info(f"NAT routing enabled ({cidr} via {interface})")
+
+    # -----------------------------------------------------------------------
+    # Main orchestration
+    # -----------------------------------------------------------------------
+
+    def restore_all(self, inventory: list, backup_paths: dict,
+                    private_key_path: str, ports: dict,
+                    network_mode: str = "provider",
+                    db_password: str = ""):
+        self._ensure_apt_proxy_on_jump()
+
+        ip_map: dict = {}
+        service_host_map: dict = {}
         for container in inventory:
             name = container["name"]
-
             if name in ports:
                 old_ip = container["ip"]
                 new_ip = ports[name].fixed_ips[0]["ip_address"]
-
                 service_host_map[name] = new_ip
-
                 if old_ip != new_ip:
                     ip_map[old_ip] = new_ip
 
-        subprocess.run(
-            "sudo sysctl -w net.ipv4.ip_forward=1",
-            shell=True,
-            capture_output=True
-        )
-
-        provider_interface = self.config.get(
-            "openstack",
-            {}
-        ).get(
-            "provider_interface",
-            "ens35"
-        )
-
-        provider_cidr = self.config.get(
-            "openstack",
-            {}
-        ).get(
-            "provider_cidr",
-            "10.0.0.0/24"
-        )
-
-        subprocess.run(
-            f"sudo iptables -t nat -C POSTROUTING "
-            f"-s {provider_cidr} -o {provider_interface} -j MASQUERADE "
-            f"2>/dev/null || "
-            f"sudo iptables -t nat -A POSTROUTING "
-            f"-s {provider_cidr} -o {provider_interface} -j MASQUERADE",
-            shell=True,
-            capture_output=True
-        )
-
-        logger.info(
-            f"NAT routing enabled for instances "
-            f"via {provider_interface}"
-        )
-
-        jump_host = self.config["openstack"]["auth_url"].split("//")[1].split(":")[0]
-        jump_user = self.config["jump"]["username"]
-        jump_password = self.config["jump"]["password"]
-
-        proxy_client = paramiko.SSHClient()
-        proxy_client.set_missing_host_key_policy(
-            paramiko.AutoAddPolicy()
-        )
-        proxy_client.connect(
-            hostname=jump_host,
-            username=jump_user,
-            password=jump_password,
-            timeout=10
-        )
-        escaped_password = self._escape_single_quotes(jump_password)
-        proxy_command = (
-            f"echo '{escaped_password}' | sudo -S -p '' "
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y apt-cacher-ng && "
-            f"echo '{escaped_password}' | sudo -S -p '' systemctl enable apt-cacher-ng && "
-            f"echo '{escaped_password}' | sudo -S -p '' systemctl start apt-cacher-ng"
-        )
-        stdin, stdout, stderr = proxy_client.exec_command(proxy_command)
-        exit_code = stdout.channel.recv_exit_status()
-        errors = stderr.read().decode().strip()
-        proxy_client.close()
-
-        if exit_code != 0:
-            raise Exception(f"Failed to prepare apt-cacher-ng: {errors}")
-
-        logger.info("APT proxy (apt-cacher-ng) ready on vm-cible")
+        self._setup_nat()
 
         for container in inventory:
             name = container["name"]
             service = container["service"]
-
             if name not in ports:
                 continue
-
-            port = ports[name]
-            ip = port.fixed_ips[0]["ip_address"]
+            ip = ports[name].fixed_ips[0]["ip_address"]
 
             if service == "mariadb":
-                self.restore_mariadb(ip, private_key_path)
-
+                self.restore_mariadb(
+                    ip, private_key_path, container, db_password
+                )
             elif service == "apache":
-                self.restore_apache(ip, private_key_path)
-
+                self.restore_apache(ip, private_key_path, container)
             elif service == "backup":
-                self.restore_backup(ip, private_key_path)
-
+                self.restore_backup(ip, private_key_path, container)
             elif service == "nfs":
-                shared_dirs = []
-                if name in backup_paths:
-                    shared_dirs = backup_paths[name].get("shared_dirs", [])
-
-                self.restore_nfs(ip, private_key_path, shared_dirs)
-
+                shared_dirs = backup_paths.get(name, {}).get(
+                    "shared_dirs", []
+                )
+                self.restore_nfs(
+                    ip, private_key_path, container, shared_dirs
+                )
             elif service == "ftp":
-                server_type = "vsftpd"
-                if name in backup_paths:
-                    server_type = backup_paths[name].get(
-                        "server_type",
-                        "vsftpd"
-                    )
-
-                self.restore_ftp(ip, private_key_path, server_type)
+                server_type = backup_paths.get(name, {}).get(
+                    "server_type", "vsftpd"
+                )
+                self.restore_ftp(
+                    ip, private_key_path, container, server_type
+                )
 
         if network_mode == "provider" and ip_map:
-            logger.info("Provider mode: updating IP configurations...")
-
+            logger.info("Provider mode: remapping IPs in configs...")
             for container in inventory:
                 name = container["name"]
-
                 if name not in ports:
                     continue
-
-                port = ports[name]
-                ip = port.fixed_ips[0]["ip_address"]
-
+                ip = ports[name].fixed_ips[0]["ip_address"]
                 self.update_ip_mappings(
-                    ip,
-                    private_key_path,
-                    ip_map,
-                    service_host_map
+                    ip, private_key_path, ip_map, service_host_map
                 )
-
         elif network_mode == "tenant":
             logger.info(
-                "Tenant mode: source IPs preserved, no IP remapping needed"
+                "Tenant mode: IPs preserved — injecting /etc/hosts only"
             )
-
             for container in inventory:
                 name = container["name"]
-
                 if name not in ports:
                     continue
-
-                port = ports[name]
-                ip = port.fixed_ips[0]["ip_address"]
-
+                ip = ports[name].fixed_ips[0]["ip_address"]
                 self.update_ip_mappings(
-                    ip,
-                    private_key_path,
-                    {},
-                    service_host_map
+                    ip, private_key_path, {}, service_host_map
                 )
-
         else:
             logger.warning(
-                f"Unknown network mode '{network_mode}', skipping IP remapping"
+                f"Unknown network mode '{network_mode}', skipping remapping"
             )
 
         logger.info("All restorations complete")

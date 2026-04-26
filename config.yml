@@ -9,6 +9,9 @@ openstack:
   user_domain_name: "default"
   project_domain_name: "default"
   region: "RegionOne"
+  # Interface réseau du provider (utilisée pour la règle NAT iptables)
+  provider_interface: "ens35"
+  provider_cidr: "10.0.0.0/24"
 
 network:
   name: "provider"
@@ -23,15 +26,27 @@ network:
 
 compute:
   image_name: "ubuntu-22.04"
-  flavor_name: "m1.migration"
+  # ssh_user : utilisateur SSH des instances cloud (ubuntu, debian, centos...)
+  # Laisser vide pour utiliser la valeur détectée automatiquement par le scanner
+  ssh_user: ""
+  keypair_name: "migration-key"
+  # flavor_name : laisser vide pour un sizing automatique basé sur les ressources
+  # des conteneurs sources (recommandé). Sinon renseigner un nom existant.
+  flavor_name: ""
+  # Valeurs utilisées uniquement si flavor_name est vide (sizing manuel de fallback)
   flavor_ram: 1024
   flavor_vcpus: 1
   flavor_disk: 10
-  keypair_name: "migration-key"
 
 storage:
   mariadb_volume_name: "mariadb-data"
   mariadb_volume_size: 10
+
+apt:
+  # Proxy APT sur le jump host (apt-cacher-ng)
+  # Mettre use_proxy: false pour laisser les instances aller sur Internet directement
+  use_proxy: true
+  proxy_port: 3142
 
 paths:
   backup_dir: "backups"
