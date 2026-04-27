@@ -92,22 +92,49 @@ class _TenantSSHClient:
         return None, _FakeStream(output, exit_code), _FakeStream(errors, exit_code)
 
     def put_file(self, local_path: str, remote_path: str):
-        """SCP a local file to the target instance via the namespace."""
-        quoted_local = shlex.quote(local_path)
+        """
+        Copy a local file to the target instance via the namespace.
+        Step 1: SFTP local_path (on the migration host) -> /tmp on jump host
+        Step 2: SCP from jump host -> target instance via netns
+        Step 3: Remove the temp file on jump host
+        """
+        import os
+        basename = os.path.basename(local_path)
+        jump_tmp = f"/tmp/migration_xfer_{basename}"
+
+        # Step 1 — upload local file to jump host via SFTP (no sudo needed)
+        sftp = self._jump.open_sftp()
+        sftp.put(local_path, jump_tmp)
+        sftp.close()
+
+        # Step 1b — ensure remote directory exists on the target instance
         quoted_remote = shlex.quote(remote_path)
+        remote_dir = remote_path.rsplit("/", 1)[0] or "/"
+        mkdir_cmd = self._wrap(f"mkdir -p {shlex.quote(remote_dir)}")
+        _, stdout, stderr = self._jump.exec_command(mkdir_cmd)
+        if stdout.channel.recv_exit_status() != 0:
+            err = stderr.read().decode().strip()
+            self._jump.exec_command(f"rm -f {jump_tmp}")
+            raise Exception(f"mkdir on target failed: {err}")
+
+        # Step 2 — SCP through namespace from jump host to target
         sudo = _sudo_prefix(self._sudo_pwd)
-        cmd = (
+        scp_cmd = (
             f"{sudo}ip netns exec {self._ns} "
             f"scp -o StrictHostKeyChecking=no "
             f"-o UserKnownHostsFile=/dev/null "
             f"-o ConnectTimeout=10 "
             f"-i {self._key} "
-            f"{quoted_local} {self._user}@{self._ip}:{quoted_remote}"
+            f"{shlex.quote(jump_tmp)} {self._user}@{self._ip}:{quoted_remote}"
         )
-        stdin, stdout, stderr = self._jump.exec_command(cmd)
+        _, stdout, stderr = self._jump.exec_command(scp_cmd)
         exit_code = stdout.channel.recv_exit_status()
+        err = stderr.read().decode().strip()
+
+        # Step 3 — cleanup
+        self._jump.exec_command(f"rm -f {jump_tmp}")
+
         if exit_code != 0:
-            err = stderr.read().decode().strip()
             raise Exception(f"put_file failed: {err}")
 
     def close(self):
