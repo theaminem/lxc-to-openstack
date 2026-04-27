@@ -80,7 +80,7 @@ class Validator:
             exit_code, dbs_out = self._run(
                 jc, client,
                 f"mysql -u {db_user} -p'{db_password}' "
-                f"-h 127.0.0.1 -N -e 'SHOW DATABASES'"
+                f"-h {ip} -N -e 'SHOW DATABASES'"
             )
             if exit_code != 0:
                 logger.error("  MariaDB validation FAILED: cannot connect")
@@ -101,7 +101,7 @@ class Validator:
                     exit_code, count_out = self._run(
                         jc, client,
                         f"mysql -u {db_user} -p'{db_password}' "
-                        f"-h 127.0.0.1 -N -e "
+                        f"-h {ip} -N -e "
                         f"\"SELECT COUNT(*) FROM \`{db}\`.\`{table}\`\""
                     )
                     if exit_code != 0:
