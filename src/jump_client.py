@@ -42,24 +42,38 @@ class _FakeStream:
         return self._exit_code
 
 
+def _esc_sq(value: str) -> str:
+    """Escape single quotes for shell single-quoted strings."""
+    return value.replace("'", "'\"'\"'")
+
+
+def _sudo_prefix(password: str) -> str:
+    """Build a non-interactive sudo prefix that pipes the password to sudo -S."""
+    if not password:
+        return "sudo -n "
+    return f"echo '{_esc_sq(password)}' | sudo -S -p '' "
+
+
 class _TenantSSHClient:
     """Presents the same exec_command / put_file interface as a normal
     paramiko SSHClient but routes all commands through the qrouter namespace
     on the jump host."""
 
     def __init__(self, jump_client, namespace, ip,
-                 remote_key_path, ssh_user):
+                 remote_key_path, ssh_user, sudo_password=""):
         self._jump = jump_client
         self._ns = namespace
         self._ip = ip
         self._key = remote_key_path
         self._user = ssh_user
+        self._sudo_pwd = sudo_password
 
     # -- helpers ------------------------------------------------------------
 
     def _wrap(self, command: str) -> str:
+        sudo = _sudo_prefix(self._sudo_pwd)
         return (
-            f"sudo ip netns exec {self._ns} "
+            f"{sudo}ip netns exec {self._ns} "
             f"ssh -o StrictHostKeyChecking=no "
             f"-o UserKnownHostsFile=/dev/null "
             f"-o ConnectTimeout=10 "
@@ -81,8 +95,9 @@ class _TenantSSHClient:
         """SCP a local file to the target instance via the namespace."""
         quoted_local = shlex.quote(local_path)
         quoted_remote = shlex.quote(remote_path)
+        sudo = _sudo_prefix(self._sudo_pwd)
         cmd = (
-            f"sudo ip netns exec {self._ns} "
+            f"{sudo}ip netns exec {self._ns} "
             f"scp -o StrictHostKeyChecking=no "
             f"-o UserKnownHostsFile=/dev/null "
             f"-o ConnectTimeout=10 "
@@ -175,12 +190,12 @@ class JumpHostClient:
 
     def _copy_key_to_jump(self, jump: paramiko.SSHClient,
                            local_key: str) -> str:
-        """Copy private key to a secure path on the jump host and chmod 600."""
-        remote_path = "/run/migration-key"
+        """Copy private key to /tmp on the jump host and chmod 600."""
+        remote_path = "/tmp/migration-key"
         sftp = jump.open_sftp()
         sftp.put(local_key, remote_path)
         sftp.close()
-        # Use paramiko transport (no password in process list)
+        # Owned by user, chmod by user — no sudo needed
         _, stdout, stderr = jump.exec_command(
             f"chmod 600 {remote_path}"
         )
@@ -192,8 +207,10 @@ class JumpHostClient:
         return remote_path
 
     def _get_router_namespace(self, jump: paramiko.SSHClient) -> str:
+        _, _, password = self._jump_info()
+        sudo = _sudo_prefix(password)
         _, stdout, _ = jump.exec_command(
-            "sudo ip netns | awk '/qrouter/ {print $1; exit}'"
+            f"{sudo}ip netns | awk '/qrouter/ {{print $1; exit}}'"
         )
         ns = stdout.read().decode().strip()
         if not ns:
@@ -213,7 +230,11 @@ class JumpHostClient:
         if self._is_tenant_ip(ip):
             remote_key = self._copy_key_to_jump(jump, private_key_path)
             ns = self._get_router_namespace(jump)
-            client = _TenantSSHClient(jump, ns, ip, remote_key, ssh_user)
+            _, _, password = self._jump_info()
+            client = _TenantSSHClient(
+                jump, ns, ip, remote_key, ssh_user,
+                sudo_password=password
+            )
             return client
 
         # Provider mode: direct TCP tunnel through jump host
