@@ -68,9 +68,36 @@ class BackupManager:
             f"MariaDB backup complete: {self._file_size(dump_path)}"
         )
 
+        # Capture row counts at backup time (after the dump) so the
+        # validator can compare against a frozen snapshot — not the live
+        # source which keeps writing during/after migration.
+        row_counts = {}
+        for db in db_list:
+            row_counts[db] = {}
+            tables_out = run_command(
+                f"sudo lxc-attach -n {name} -- "
+                f"mysql -u root -N -e 'SHOW TABLES IN `{db}`'"
+            )
+            for table in tables_out.split("\n"):
+                table = table.strip()
+                if not table:
+                    continue
+                count_out = run_command(
+                    f"sudo lxc-attach -n {name} -- "
+                    f"mysql -u root -N -e "
+                    f"'SELECT COUNT(*) FROM `{db}`.`{table}`'"
+                )
+                try:
+                    row_counts[db][table] = int(count_out.strip())
+                except ValueError:
+                    row_counts[db][table] = 0
+        total_rows = sum(sum(t.values()) for t in row_counts.values())
+        logger.info(f"  Captured {total_rows} rows across {len(db_list)} DBs")
+
         return {
             "dump": dump_path,
-            "users": users_path
+            "users": users_path,
+            "row_counts": row_counts,
         }
 
     def backup_apache(self, name):

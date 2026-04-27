@@ -56,7 +56,8 @@ class Validator:
 
     def validate_mariadb(self, ip: str, private_key_path: str,
                           container: dict, db_user: str,
-                          db_password: str) -> bool:
+                          db_password: str,
+                          backup_paths: dict) -> bool:
         logger.info(f"Validating MariaDB on {ip}...")
         app_databases = container.get("app_databases", [])
         container_name = container["name"]
@@ -67,10 +68,21 @@ class Validator:
             )
             return True
 
-        # Get source counts
-        source_counts = self._get_source_databases(
-            container_name, app_databases
-        )
+        # Use frozen row counts captured at backup time. If absent
+        # (e.g. backup made by an older version), fall back to the live
+        # source counts (which may drift if the source kept writing).
+        source_counts = backup_paths.get("row_counts")
+        if source_counts:
+            logger.info(
+                "  Using row counts captured at backup time (frozen snapshot)"
+            )
+        else:
+            logger.warning(
+                "  No frozen counts in backup_paths — querying live source"
+            )
+            source_counts = self._get_source_databases(
+                container_name, app_databases
+            )
 
         passed = True
         with JumpHostClient(self.config) as jc:
@@ -287,7 +299,8 @@ class Validator:
                 if service == "mariadb":
                     results[name] = self.validate_mariadb(
                         ip, private_key_path, container,
-                        db_user, db_password
+                        db_user, db_password,
+                        backup_paths.get(name, {})
                     )
                 elif service == "apache":
                     results[name] = self.validate_apache(
