@@ -47,11 +47,30 @@ class Restorer:
             hostname=jump_host, username=jump_user,
             password=jump_password, timeout=10
         )
-        _, stdout, stderr = client.exec_command(
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y apt-cacher-ng "
-            "&& systemctl enable apt-cacher-ng "
-            "&& systemctl start apt-cacher-ng"
+
+        # Skip install if already installed and running
+        _, st, _ = client.exec_command(
+            "systemctl is-active apt-cacher-ng 2>/dev/null"
         )
+        already = st.channel.recv_exit_status() == 0
+        if already:
+            client.close()
+            logger.info(
+                f"APT proxy already running on {jump_host}:"
+                f"{apt_cfg.get('proxy_port', 3142)}"
+            )
+            return
+
+        # sudo with password piped via stdin
+        escaped_pwd = jump_password.replace("'", "'\"'\"'")
+        sudo_prefix = f"echo '{escaped_pwd}' | sudo -S -p '' "
+        cmd = (
+            f"{sudo_prefix}DEBIAN_FRONTEND=noninteractive "
+            f"apt-get install -y apt-cacher-ng && "
+            f"{sudo_prefix}systemctl enable apt-cacher-ng && "
+            f"{sudo_prefix}systemctl start apt-cacher-ng"
+        )
+        _, stdout, stderr = client.exec_command(cmd)
         rc = stdout.channel.recv_exit_status()
         client.close()
         if rc != 0:
