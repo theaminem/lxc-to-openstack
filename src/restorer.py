@@ -107,6 +107,12 @@ class Restorer:
             codename = jc.run(
                 client, "lsb_release -cs", "Detecting OS release"
             ).strip() or "jammy"
+
+        # Use HTTPS by default — protects against transparent HTTP proxies
+        # / port 80 interception by network gear or hypervisor services.
+        # Disable with: apt.use_https: false in config.yml
+        scheme = "https" if self.config.get("apt", {}).get("use_https", True) else "http"
+
         jc.run_soft(
             client,
             "sudo rm -f /etc/apt/sources.list.d/ubuntu.sources",
@@ -115,11 +121,11 @@ class Restorer:
         jc.run(
             client,
             f"printf '%s\\n' "
-            f"'deb http://archive.ubuntu.com/ubuntu {codename} main restricted universe multiverse' "
-            f"'deb http://archive.ubuntu.com/ubuntu {codename}-updates main restricted universe multiverse' "
-            f"'deb http://security.ubuntu.com/ubuntu {codename}-security main restricted universe multiverse' "
+            f"'deb {scheme}://archive.ubuntu.com/ubuntu {codename} main restricted universe multiverse' "
+            f"'deb {scheme}://archive.ubuntu.com/ubuntu {codename}-updates main restricted universe multiverse' "
+            f"'deb {scheme}://security.ubuntu.com/ubuntu {codename}-security main restricted universe multiverse' "
             f"| sudo tee /etc/apt/sources.list > /dev/null",
-            f"Writing APT sources ({codename})"
+            f"Writing APT sources ({codename}, {scheme})"
         )
         jc.run(client, "sudo apt-get clean", "Cleaning APT cache")
         jc.run(
