@@ -183,7 +183,11 @@ class JumpHostClient:
         return host, user, password
 
     def _ssh_user(self) -> str:
-        return self._config.get("compute", {}).get("ssh_user", "ubuntu")
+        # .get() returns the default only if the key is MISSING. An empty
+        # string in the YAML returns "" — which would produce an invalid
+        # SSH destination like "@10.0.3.20". Fallback to "ubuntu" when blank.
+        value = self._config.get("compute", {}).get("ssh_user", "ubuntu")
+        return value.strip() or "ubuntu"
 
     def _is_tenant_ip(self, ip: str) -> bool:
         """Derive the tenant prefix from config, not hardcoded."""
