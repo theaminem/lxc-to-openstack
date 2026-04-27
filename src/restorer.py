@@ -84,6 +84,12 @@ class Restorer:
     def _configure_apt_proxy_on_instance(self, jc: JumpHostClient, client):
         apt_cfg = self.config.get("apt", {})
         if not apt_cfg.get("use_proxy", True):
+            # Make sure no leftover proxy config from a previous run
+            jc.run_soft(
+                client,
+                "sudo rm -f /etc/apt/apt.conf.d/00proxy",
+                "Removing any leftover APT proxy"
+            )
             logger.info("  APT proxy disabled — direct Internet access")
             return
         jump_host = self.config["openstack"]["auth_url"].split("//")[1].split(":")[0]
