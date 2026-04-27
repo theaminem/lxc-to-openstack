@@ -244,6 +244,7 @@ def main():
             )
 
             state["private_key_path"] = private_key_path
+            state["phase_completed"] = 3
             save_state(state)
             logger.info("PHASE 3 COMPLETE")
             ask_continue(auto_yes)
@@ -379,11 +380,25 @@ def main():
 
     except Exception as e:
         logger.error(f"Migration failed: {e}")
-        logger.info("Starting rollback...")
-        try:
-            rollback.execute(conn)
-        except Exception:
-            rollback.execute(None)
+        # Auto-rollback only when failure happens before/during instance
+        # provisioning. If instances and backups already exist, keep them
+        # so the user can investigate and resume with --resume-from.
+        completed = state.get("phase_completed", 0)
+        if completed < 3:
+            logger.info("Starting rollback...")
+            try:
+                rollback.execute(conn)
+            except Exception:
+                rollback.execute(None)
+        else:
+            logger.warning(
+                f"Skipping auto-rollback (instances already provisioned). "
+                f"Resume with: python3 migrate.py --resume-from phase{completed + 1}"
+            )
+            logger.warning(
+                "To clean up manually: openstack server delete instance-* "
+                "&& openstack volume delete mariadb-data"
+            )
         sys.exit(1)
 
 
