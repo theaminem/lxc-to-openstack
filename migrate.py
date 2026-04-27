@@ -138,9 +138,9 @@ def main():
 
     config["jump"] = {"username": jump_user, "password": jump_password}
 
-    # MariaDB app password (asked only if restore/validate phases will run)
+    # MariaDB app password (needed for both restore phase 6 and validate phase 7)
     db_password = ""
-    if resume_phase <= 5:
+    if resume_phase <= 6:
         db_password = getpass.getpass(
             "MariaDB app user password (new instances): "
         )
