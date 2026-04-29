@@ -80,7 +80,7 @@ class Provisioner:
         jump_password = self.config["jump"]["password"]
 
         client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.set_missing_host_key_policy(paramiko.WarningPolicy())
         client.connect(
             hostname=jump_host, username=jump_user,
             password=jump_password, timeout=10,
@@ -121,49 +121,25 @@ class Provisioner:
     # Flavor (auto-sized)
     # -----------------------------------------------------------------------
 
-    def _compute_needed_resources(self, inventory: list) -> dict:
-        """
-        Compute the required RAM/disk/vCPU from scanner data.
-        Takes the maximum across all containers (each gets its own instance).
-        """
-        max_ram_mb = 512
-        max_disk_mb = 1024
-
-        for container in inventory:
-            ram_mb = container.get("ram_mb", {}).get("used", 256)
-            disk_mb = container.get("disk_mb", 1024)
-            max_ram_mb = max(max_ram_mb, ram_mb)
-            max_disk_mb = max(max_disk_mb, disk_mb)
-
-        needed_ram_mb = max(512, math.ceil(max_ram_mb * RAM_MARGIN / 128) * 128)
-        needed_disk_gb = max(10, math.ceil(max_disk_mb * DISK_MARGIN / 1024))
-
-        return {
-            "ram_mb": needed_ram_mb,
-            "disk_gb": needed_disk_gb,
-            "vcpus": 1,
-        }
-
-    def ensure_flavor(self, inventory: list):
+    def ensure_flavor(self, container: dict):
         comp = self.config["compute"]
         flavor_name = comp.get("flavor_name", "").strip()
 
         if flavor_name:
-            # Use explicitly configured flavor
             existing = self.conn.compute.find_flavor(flavor_name)
             if existing:
                 logger.info(f"Flavor {flavor_name} already exists, reusing")
                 return existing
-            # Create it with config values
             ram = comp.get("flavor_ram", 1024)
             vcpus = comp.get("flavor_vcpus", 1)
             disk = comp.get("flavor_disk", 10)
         else:
-            # Auto-size from scanner data
-            needed = self._compute_needed_resources(inventory)
-            ram = needed["ram_mb"]
-            vcpus = needed["vcpus"]
-            disk = needed["disk_gb"]
+            # Auto-size from this container's actual resource usage
+            ram_mb = container.get("ram_mb", {}).get("used", 256)
+            disk_mb = container.get("disk_mb", 1024)
+            ram = max(512, math.ceil(ram_mb * RAM_MARGIN / 128) * 128)
+            disk = max(10, math.ceil(disk_mb * DISK_MARGIN / 1024))
+            vcpus = 1
             flavor_name = f"migration-auto-{ram}mb-{disk}gb"
 
             existing = self.conn.compute.find_flavor(flavor_name)
@@ -300,7 +276,6 @@ class Provisioner:
 
     def provision_all(self, inventory: list, ports: dict):
         image = self.ensure_image(inventory)
-        flavor = self.ensure_flavor(inventory)
         keypair, private_key_path = self.ensure_keypair()
         keypair_name = self.config["compute"]["keypair_name"]
 
@@ -318,6 +293,7 @@ class Provisioner:
             name = container["name"]
             if name not in ports:
                 continue
+            flavor = self.ensure_flavor(container)
             server = self.create_instance(
                 f"instance-{name}",
                 image, flavor,
@@ -340,17 +316,16 @@ class Provisioner:
                     break
 
         # Wait for SSH on all instances
-        # ssh_user resolved: config > detected by scanner > fallback 'ubuntu'
+        # cfg_ssh_user is read once before the loop so mutations don't bleed
+        # across containers with different OSes (ubuntu vs debian).
         cfg_ssh_user = self.config.get("compute", {}).get("ssh_user", "").strip()
         for container in inventory:
             name = container["name"]
             if name not in ports:
                 continue
 
-            # Override ssh_user in config if scanner detected a different one
-            if not cfg_ssh_user:
-                detected = container.get("os", {}).get("default_ssh_user", "ubuntu")
-                self.config.setdefault("compute", {})["ssh_user"] = detected
+            detected = container.get("os", {}).get("default_ssh_user", "ubuntu")
+            self.config["compute"]["ssh_user"] = cfg_ssh_user or detected
 
             ip = ports[name].fixed_ips[0]["ip_address"]
             with JumpHostClient(self.config) as jc:

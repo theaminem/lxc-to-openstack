@@ -24,7 +24,7 @@ class Transfer:
     # -----------------------------------------------------------------------
 
     def _upload(self, ip: str, private_key_path: str,
-                local_path: str, remote_path: str):
+                local_path: str, remote_path: str, mode: str = ""):
         if not os.path.exists(local_path):
             logger.warning(f"File not found, skipping: {local_path}")
             return False
@@ -37,11 +37,12 @@ class Transfer:
 
         with JumpHostClient(self.config) as jc:
             client = jc.connect(ip, private_key_path)
-            # Ensure remote directory exists
             remote_dir = remote_path.rsplit("/", 1)[0]
             if remote_dir:
                 jc.run_soft(client, f"mkdir -p {remote_dir}")
             jc.put_file(client, local_path, remote_path)
+            if mode:
+                jc.run_soft(client, f"chmod {mode} {remote_path}")
 
         logger.info(f"  Done: {remote_path}")
         return True
@@ -54,9 +55,7 @@ class Transfer:
                           backup_paths: dict):
         logger.info(f"Transferring MariaDB data to {ip}...")
         self._upload(ip, private_key_path,
-                     backup_paths["dump"], "/tmp/mariadb_dump.sql")
-        self._upload(ip, private_key_path,
-                     backup_paths["users"], "/tmp/mariadb_users.sql")
+                     backup_paths["dump"], "/tmp/mariadb_dump.sql", mode="600")
         logger.info("MariaDB transfer complete")
 
     def transfer_apache(self, ip: str, private_key_path: str,

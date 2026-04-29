@@ -10,7 +10,7 @@ openstack:
   project_domain_name: "default"
   region: "RegionOne"
   # Interface réseau du provider (utilisée pour la règle NAT iptables)
-  provider_interface: "ens35"
+  provider_interface: "ens33"
   provider_cidr: "10.0.0.0/24"
 
 network:
@@ -32,7 +32,7 @@ compute:
   keypair_name: "migration-key"
   # flavor_name : laisser vide pour un sizing automatique basé sur les ressources
   # des conteneurs sources (recommandé). Sinon renseigner un nom existant.
-  flavor_name: ""
+  flavor_name: "m1.migration"
   # Valeurs utilisées uniquement si flavor_name est vide (sizing manuel de fallback)
   flavor_ram: 1024
   flavor_vcpus: 1
@@ -45,7 +45,7 @@ storage:
 apt:
   # Proxy APT sur le jump host (apt-cacher-ng)
   # Mettre use_proxy: false pour laisser les instances aller sur Internet directement
-  use_proxy: true
+  use_proxy: false
   proxy_port: 3142
 
 paths:

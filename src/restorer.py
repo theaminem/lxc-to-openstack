@@ -13,6 +13,7 @@ Améliorations v2 :
 """
 
 import logging
+import shlex
 import subprocess
 
 import paramiko
@@ -42,7 +43,7 @@ class Restorer:
         jump_password = self.config["jump"]["password"]
 
         client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.set_missing_host_key_policy(paramiko.WarningPolicy())
         client.connect(
             hostname=jump_host, username=jump_user,
             password=jump_password, timeout=10,
@@ -163,12 +164,14 @@ class Restorer:
 
     def _replace_ip_in_configs(self, jc: JumpHostClient, client,
                                 old_ip: str, new_value: str):
+        # Escape dots so sed treats them as literals, not regex wildcards
+        escaped_old = old_ip.replace(".", "\\.")
         safe_paths = "/etc /var/www /root"
         jc.run_soft(
             client,
-            f"sudo grep -rl '{old_ip}' {safe_paths} 2>/dev/null | "
+            f"sudo grep -rl '{escaped_old}' {safe_paths} 2>/dev/null | "
             f"while read f; do "
-            f"sudo sed -i 's/{old_ip}/{new_value}/g' \"$f\"; "
+            f"sudo sed -i 's/{escaped_old}/{new_value}/g' \"$f\"; "
             f"done",
             f"Replacing {old_ip} -> {new_value} in configs"
         )
@@ -206,8 +209,14 @@ class Restorer:
                 logger.info("  Cinder volume detected, configuring...")
                 jc.run_soft(client, "sudo systemctl stop mariadb",
                             "Stopping MariaDB")
-                jc.run(client, "sudo mkfs.ext4 -F /dev/vdb",
-                       "Formatting Cinder volume")
+                already_formatted = jc.run_soft(
+                    client, "sudo blkid /dev/vdb", "Checking volume format"
+                )
+                if not already_formatted:
+                    jc.run(client, "sudo mkfs.ext4 /dev/vdb",
+                           "Formatting Cinder volume")
+                else:
+                    logger.info("  Volume already formatted, skipping mkfs")
                 jc.run(client, "sudo mkdir -p /mnt/mariadb-data",
                        "Creating mount point")
                 jc.run(client, "sudo mount /dev/vdb /mnt/mariadb-data",
@@ -252,23 +261,29 @@ class Restorer:
             if app_users:
                 for u in app_users:
                     user = u["user"]
+                    safe_user = user.replace("'", "\\'")
+                    safe_pwd = db_password.replace("'", "\\'")
+                    create_sql = (
+                        f"CREATE USER IF NOT EXISTS '{safe_user}'@'%' "
+                        f"IDENTIFIED BY '{safe_pwd}'; "
+                        f"GRANT ALL PRIVILEGES ON *.* TO '{safe_user}'@'%'; "
+                        f"FLUSH PRIVILEGES;"
+                    )
                     jc.run(
                         client,
-                        f"sudo mysql -u root -e \""
-                        f"CREATE USER IF NOT EXISTS '{user}'@'%' "
-                        f"IDENTIFIED BY '{db_password}'; "
-                        f"GRANT ALL PRIVILEGES ON *.* TO '{user}'@'%'; "
-                        f"FLUSH PRIVILEGES;\"",
+                        f"echo {shlex.quote(create_sql)} | sudo mysql -u root",
                         f"Recreating user '{user}'"
                     )
                     if subnet_prefix:
+                        del_sql = (
+                            f"DELETE FROM mysql.user "
+                            f"WHERE User='{safe_user}' "
+                            f"AND Host LIKE '{subnet_prefix}.%'; "
+                            f"FLUSH PRIVILEGES;"
+                        )
                         jc.run_soft(
                             client,
-                            f"sudo mysql -u root -e \""
-                            f"DELETE FROM mysql.user "
-                            f"WHERE User='{user}' "
-                            f"AND Host LIKE '{subnet_prefix}.%'; "
-                            f"FLUSH PRIVILEGES;\""
+                            f"echo {shlex.quote(del_sql)} | sudo mysql -u root"
                         )
             else:
                 logger.warning("  No app users in inventory — skipping")

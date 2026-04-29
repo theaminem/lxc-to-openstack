@@ -143,6 +143,10 @@ class _TenantSSHClient:
             raise Exception(f"put_file failed: {err}")
 
     def close(self):
+        try:
+            self._jump.exec_command(f"rm -f {self._key}")
+        except Exception:
+            pass
         self._jump.close()
 
 
@@ -214,7 +218,7 @@ class JumpHostClient:
         client = paramiko.SSHClient()
         # Use RejectPolicy; we load the jump host key on first connect
         # via a dedicated known_hosts file in our secure temp dir.
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.set_missing_host_key_policy(paramiko.WarningPolicy())
         client.connect(
             hostname=host,
             username=user,
@@ -230,15 +234,13 @@ class JumpHostClient:
 
     def _copy_key_to_jump(self, jump: paramiko.SSHClient,
                            local_key: str) -> str:
-        """Copy private key to /tmp on the jump host and chmod 600."""
-        remote_path = "/tmp/migration-key"
+        """Copy private key to a unique path in /tmp on the jump host."""
+        import uuid
+        remote_path = f"/tmp/migration-key-{uuid.uuid4().hex[:8]}"
         sftp = jump.open_sftp()
         sftp.put(local_key, remote_path)
         sftp.close()
-        # Owned by user, chmod by user — no sudo needed
-        _, stdout, stderr = jump.exec_command(
-            f"chmod 600 {remote_path}"
-        )
+        _, stdout, stderr = jump.exec_command(f"chmod 600 {remote_path}")
         rc = stdout.channel.recv_exit_status()
         if rc != 0:
             raise Exception(
@@ -284,7 +286,7 @@ class JumpHostClient:
             "direct-tcpip", (ip, 22), (host, 0)
         )
         target = paramiko.SSHClient()
-        target.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        target.set_missing_host_key_policy(paramiko.WarningPolicy())
         key = paramiko.RSAKey.from_private_key_file(private_key_path)
         target.connect(
             hostname=ip,

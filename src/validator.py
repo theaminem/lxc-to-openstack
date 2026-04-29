@@ -114,7 +114,7 @@ class Validator:
                         jc, client,
                         f"mysql -u {db_user} -p'{db_password}' "
                         f"-h {ip} -N -e "
-                        f"\"SELECT COUNT(*) FROM \`{db}\`.\`{table}\`\""
+                        f"\"SELECT COUNT(*) FROM `{db}`.`{table}`\""
                     )
                     if exit_code != 0:
                         logger.error(

@@ -2,7 +2,6 @@
 Scanner — découverte de l'infrastructure LXC source.
 
 Nouveautés v2 :
-- run_command() sans shell=True (protection injection)
 - detect_os() : codename Ubuntu/Debian + chemin config MariaDB
 - get_mariadb_app_users() : users applicatifs réels (pas root/system)
 - get_disk_usage_mb() : retourne un entier MB pour le sizing automatique
@@ -38,17 +37,6 @@ def _lxc_host(*cmd_args: str) -> str:
     """Run a host-level lxc command (lxc-ls, lxc-info…)."""
     result = subprocess.run(
         ["sudo"] + list(cmd_args),
-        capture_output=True,
-        text=True
-    )
-    return result.stdout.strip()
-
-
-# Keep run_command for backward compatibility with other modules
-def run_command(command: str) -> str:
-    result = subprocess.run(
-        command,
-        shell=True,
         capture_output=True,
         text=True
     )
@@ -124,8 +112,6 @@ def _detect_mariadb_cnf_path(name: str) -> str:
         "/etc/mysql/mariadb.cnf",
     ]
     for path in candidates:
-        out = _lxc_attach(name, "test", "-f", path)
-        # test -f returns empty stdout; check via return code
         result = subprocess.run(
             ["sudo", "lxc-attach", "-n", name, "--", "test", "-f", path],
             capture_output=True
