@@ -209,3 +209,4 @@ __marimo__/
 keys/
 logs/
 backups/
+migration_state.json
