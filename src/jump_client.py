@@ -16,8 +16,13 @@ import shlex
 import stat
 import tempfile
 import time
+import warnings
 
 import paramiko
+
+# Paramiko 3.x warns when AutoAddPolicy accepts an unknown host key.
+# We use AutoAddPolicy intentionally for internal migration infra.
+warnings.filterwarnings("ignore", category=UserWarning, module="paramiko")
 
 logger = logging.getLogger("migration")
 
@@ -214,7 +219,11 @@ class JumpHostClient:
             hostname=host,
             username=user,
             password=password,
-            timeout=10
+            timeout=10,
+            gss_auth=False,
+            gss_kex=False,
+            look_for_keys=False,
+            allow_agent=False,
         )
         self._open_clients.append(client)
         return client
@@ -282,7 +291,11 @@ class JumpHostClient:
             username=ssh_user,
             pkey=key,
             sock=channel,
-            timeout=10
+            timeout=10,
+            gss_auth=False,
+            gss_kex=False,
+            look_for_keys=False,
+            allow_agent=False,
         )
         self._open_clients.append(target)
         return target
@@ -292,14 +305,21 @@ class JumpHostClient:
         """Poll until SSH is reachable on `ip`, with a timeout."""
         logger.info(f"Waiting for SSH on {ip}...")
         start = time.time()
+        client = None
         while time.time() - start < timeout:
             try:
-                client = self.connect(ip, private_key_path)
+                if client is None:
+                    client = self.connect(ip, private_key_path)
                 self.run(client, "hostname", raise_on_error=False)
                 logger.info(f"SSH ready on {ip}")
                 return True
             except Exception as exc:
                 logger.debug(f"SSH not ready on {ip}: {exc}")
+                # Tenant clients wrap a persistent jump connection — safe to
+                # reuse. Provider clients use a per-connection channel that
+                # gets closed on failure and must be rebuilt.
+                if not isinstance(client, _TenantSSHClient):
+                    client = None
                 time.sleep(5)
         logger.error(f"SSH timeout on {ip} after {timeout}s")
         return False

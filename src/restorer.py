@@ -45,7 +45,9 @@ class Restorer:
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(
             hostname=jump_host, username=jump_user,
-            password=jump_password, timeout=10
+            password=jump_password, timeout=10,
+            gss_auth=False, gss_kex=False,
+            look_for_keys=False, allow_agent=False,
         )
 
         # Skip install if already installed and running
