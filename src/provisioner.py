@@ -254,6 +254,14 @@ class Provisioner:
                 self.conn.compute.delete_server(existing.id)
                 self.conn.compute.wait_for_delete(existing)
 
+        # Cloud-init userdata: disable UseDNS in sshd (reverse DNS lookup
+        # on the client IP can add 30s to every SSH connection when there is
+        # no PTR record — which is always the case on a tenant network).
+        userdata = (
+            "#!/bin/bash\n"
+            "sed -i 's/^#*UseDNS.*/UseDNS no/' /etc/ssh/sshd_config\n"
+            "systemctl restart sshd\n"
+        )
         server = self.conn.compute.create_server(
             name=name,
             image_id=image.id,
@@ -261,6 +269,7 @@ class Provisioner:
             networks=[{"port": port.id}],
             key_name=keypair_name,
             config_drive=True,
+            user_data=userdata,
         )
         self.rollback.register("server", server.id, name)
         logger.info(f"Creating instance: {name}")

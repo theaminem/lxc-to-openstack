@@ -81,7 +81,7 @@ class _TenantSSHClient:
             f"{sudo}ip netns exec {self._ns} "
             f"ssh -o StrictHostKeyChecking=no "
             f"-o UserKnownHostsFile=/dev/null "
-            f"-o ConnectTimeout=10 "
+            f"-o ConnectTimeout=30 "
             f"-i {self._key} "
             f"{self._user}@{self._ip} {shlex.quote(command)}"
         )
@@ -128,7 +128,7 @@ class _TenantSSHClient:
             f"{sudo}ip netns exec {self._ns} "
             f"scp -o StrictHostKeyChecking=no "
             f"-o UserKnownHostsFile=/dev/null "
-            f"-o ConnectTimeout=10 "
+            f"-o ConnectTimeout=30 "
             f"-i {self._key} "
             f"{shlex.quote(jump_tmp)} {self._user}@{self._ip}:{quoted_remote}"
         )
