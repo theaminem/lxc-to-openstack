@@ -133,7 +133,7 @@ class Restorer:
         jc.run(client, "sudo apt-get clean", "Cleaning APT cache")
         jc.run(
             client,
-            "sudo DEBIAN_FRONTEND=noninteractive apt-get update",
+            "sudo timeout 120 DEBIAN_FRONTEND=noninteractive apt-get update -qq",
             "Updating APT index"
         )
 
