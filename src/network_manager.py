@@ -58,7 +58,7 @@ class NetworkManager:
                     gateway_ip=source_gateway,
                     dns_nameservers=["8.8.8.8"],
                     allocation_pools=[{
-                        "start": base + ".10",
+                        "start": base + ".2",
                         "end": base + ".250"
                     }],
                     enable_dhcp=True
