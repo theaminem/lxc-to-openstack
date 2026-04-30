@@ -9,6 +9,7 @@ Améliorations v2 :
 - _is_tenant_ip() supprimé (géré par JumpHostClient)
 """
 
+import base64
 import logging
 import math
 import os
@@ -257,11 +258,14 @@ class Provisioner:
         # Cloud-init userdata: disable UseDNS in sshd (reverse DNS lookup
         # on the client IP can add 30s to every SSH connection when there is
         # no PTR record — which is always the case on a tenant network).
-        userdata = (
+        userdata_raw = (
             "#!/bin/bash\n"
             "sed -i 's/^#*UseDNS.*/UseDNS no/' /etc/ssh/sshd_config\n"
             "systemctl restart sshd\n"
         )
+        userdata_b64 = base64.b64encode(
+            userdata_raw.encode()
+        ).decode()
         server = self.conn.compute.create_server(
             name=name,
             image_id=image.id,
@@ -269,7 +273,7 @@ class Provisioner:
             networks=[{"port": port.id}],
             key_name=keypair_name,
             config_drive=True,
-            user_data=userdata,
+            user_data=userdata_b64,
         )
         self.rollback.register("server", server.id, name)
         logger.info(f"Creating instance: {name}")
