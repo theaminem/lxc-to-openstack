@@ -137,6 +137,20 @@ class Restorer:
             "Updating APT index"
         )
 
+    def _apt_install(self, jc: JumpHostClient, client, packages: str,
+                     description: str = ""):
+        """apt-get install with one automatic retry on 404 (stale mirror index)."""
+        cmd = f"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y {packages}"
+        try:
+            jc.run(client, cmd, description)
+        except Exception as first_err:
+            if "404" not in str(first_err) and "Unable to fetch" not in str(first_err):
+                raise
+            logger.warning("apt-get install hit a 404 — refreshing APT index and retrying...")
+            jc.run(client, "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq",
+                   "Refreshing APT index (retry)")
+            jc.run(client, cmd, f"{description} (retry)")
+
     # -----------------------------------------------------------------------
     # IP / hosts mapping
     # -----------------------------------------------------------------------
@@ -196,12 +210,7 @@ class Restorer:
             self._configure_apt_proxy_on_instance(jc, client)
             self._fix_apt_sources(jc, client, codename)
 
-            jc.run(
-                client,
-                "sudo DEBIAN_FRONTEND=noninteractive "
-                "apt-get install -y mariadb-server",
-                "Installing mariadb-server"
-            )
+            self._apt_install(jc, client, "mariadb-server", "Installing mariadb-server")
 
             # Cinder volume setup
             vdb_check = jc.run_soft(client, "ls /dev/vdb 2>/dev/null")
@@ -314,12 +323,9 @@ class Restorer:
             self._configure_apt_proxy_on_instance(jc, client)
             self._fix_apt_sources(jc, client, codename)
 
-            jc.run(
-                client,
-                "sudo DEBIAN_FRONTEND=noninteractive "
-                "apt-get install -y apache2 php php-mysql libapache2-mod-php",
-                "Installing Apache + PHP"
-            )
+            self._apt_install(jc, client,
+                              "apache2 php php-mysql libapache2-mod-php",
+                              "Installing Apache + PHP")
             jc.run(
                 client,
                 "sudo tar xzf /tmp/apache_backup.tar.gz -C /",
@@ -367,12 +373,7 @@ class Restorer:
             self._configure_apt_proxy_on_instance(jc, client)
             self._fix_apt_sources(jc, client, codename)
 
-            jc.run(
-                client,
-                "sudo DEBIAN_FRONTEND=noninteractive "
-                "apt-get install -y mariadb-client",
-                "Installing mariadb-client"
-            )
+            self._apt_install(jc, client, "mariadb-client", "Installing mariadb-client")
             jc.run_soft(
                 client,
                 "sudo cp /tmp/backup_script.sh /root/backup.sh "
@@ -400,12 +401,7 @@ class Restorer:
             self._configure_apt_proxy_on_instance(jc, client)
             self._fix_apt_sources(jc, client, codename)
 
-            jc.run(
-                client,
-                "sudo DEBIAN_FRONTEND=noninteractive "
-                "apt-get install -y nfs-kernel-server",
-                "Installing NFS server"
-            )
+            self._apt_install(jc, client, "nfs-kernel-server", "Installing NFS server")
             jc.run(client, "sudo cp /tmp/nfs_exports.txt /etc/exports",
                    "Restoring /etc/exports")
             for d in shared_dirs:
@@ -435,12 +431,7 @@ class Restorer:
             self._configure_apt_proxy_on_instance(jc, client)
             self._fix_apt_sources(jc, client, codename)
 
-            jc.run(
-                client,
-                f"sudo DEBIAN_FRONTEND=noninteractive "
-                f"apt-get install -y {server_type}",
-                f"Installing {server_type}"
-            )
+            self._apt_install(jc, client, server_type, f"Installing {server_type}")
             config_dest = (
                 "/etc/vsftpd.conf"
                 if server_type == "vsftpd"
