@@ -223,10 +223,14 @@ def main():
                 net_manager = NetworkManager(config, rollback)
                 conn = net_manager.connect(username, password)
             logger.info("Phase 2 skipped (loaded network state)")
-            # Reconstruct ports objects
+            # Reconstruct port-like objects from saved IPs (avoids find_port
+            # returning None when the port exists but isn't found by name).
+            class _PortStub:
+                def __init__(self, ip):
+                    self.fixed_ips = [{"ip_address": ip}]
             ports = {
-                name: conn.network.find_port(f"port-{name}")
-                for name in state.get("ports_ips", {})
+                name: _PortStub(ip)
+                for name, ip in state.get("ports_ips", {}).items()
             }
 
         # ==================================================================
