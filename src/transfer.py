@@ -105,6 +105,16 @@ class Transfer:
 
     def transfer_all(self, inventory: list, backup_paths: dict,
                      private_key_path: str, ports: dict):
+        # Verify SSH is still reachable on every instance before
+        # starting transfers (cloud-init may restart sshd after Phase 3).
+        for container in inventory:
+            name = container["name"]
+            if name not in ports or name not in backup_paths:
+                continue
+            ip = ports[name].fixed_ips[0]["ip_address"]
+            with JumpHostClient(self.config) as jc:
+                jc.wait_for_ssh(ip, private_key_path, timeout=120)
+
         for container in inventory:
             name = container["name"]
             service = container["service"]
