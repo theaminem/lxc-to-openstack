@@ -259,7 +259,8 @@ class Provisioner:
             image_id=image.id,
             flavor_id=flavor.id,
             networks=[{"port": port.id}],
-            key_name=keypair_name
+            key_name=keypair_name,
+            config_drive=True,
         )
         self.rollback.register("server", server.id, name)
         logger.info(f"Creating instance: {name}")

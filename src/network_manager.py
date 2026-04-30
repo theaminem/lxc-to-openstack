@@ -61,7 +61,7 @@ class NetworkManager:
                         "start": base + ".10",
                         "end": base + ".250"
                     }],
-                    enable_dhcp=False
+                    enable_dhcp=True
                 )
                 self.rollback.register(
                     "subnet", subnet.id, "migration-subnet"
